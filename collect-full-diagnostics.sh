@@ -188,7 +188,8 @@ collect_tcpdump_from_cluster() {
     fi
 
     # Create DaemonSet YAML for tcpdump
-    cat <<EOF | kubectl apply --kubeconfig="${kubeconfig}" --context="${context}" -f - >/dev/null 2>&1
+    echo "  Applying tcpdump DaemonSet..."
+    cat <<EOF | kubectl apply --kubeconfig="${kubeconfig}" --context="${context}" -f -
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -278,7 +279,9 @@ EOF
     sleep 5
 
     # Wait for pod to be ready
-    kubectl wait --for=condition=Ready pod -l app=submariner-tcpdump-collector -n submariner-operator --kubeconfig="${kubeconfig}" --context="${context}" --timeout=30s >/dev/null 2>&1
+    if ! kubectl wait --for=condition=Ready pod -l app=submariner-tcpdump-collector -n submariner-operator --kubeconfig="${kubeconfig}" --context="${context}" --timeout=30s 2>&1; then
+        echo "  ⚠ Warning: Pod did not become ready within 30s, will attempt to continue..."
+    fi
 
     # Get the tcpdump pod running on the selected gateway node
     TCPDUMP_POD=$(kubectl get pods -n submariner-operator -l app=submariner-tcpdump-collector --kubeconfig="${kubeconfig}" --context="${context}" -o jsonpath="{.items[?(@.spec.nodeName==\"${GATEWAY_NODE}\")].metadata.name}" 2>/dev/null)
@@ -297,10 +300,10 @@ EOF
 
     # Extract pcap file (using kubectl exec instead of cp since nettest image doesn't have tar)
     echo "  Extracting files from ${cluster_name}..."
-    kubectl exec -n submariner-operator "${TCPDUMP_POD}" --kubeconfig="${kubeconfig}" --context="${context}" -- cat /tmp/gateway-traffic.pcap > "${tcpdump_dir}/${cluster_name}-gateway-${GATEWAY_NODE}.pcap" 2>/dev/null
+    kubectl exec -n submariner-operator "${TCPDUMP_POD}" --kubeconfig="${kubeconfig}" --context="${context}" -- cat /tmp/gateway-traffic.pcap > "${tcpdump_dir}/${cluster_name}-gateway-${GATEWAY_NODE}.pcap"
 
     # Extract analysis file
-    kubectl exec -n submariner-operator "${TCPDUMP_POD}" --kubeconfig="${kubeconfig}" --context="${context}" -- cat /tmp/gateway-analysis.txt > "${tcpdump_dir}/${cluster_name}-gateway-${GATEWAY_NODE}-analysis.txt" 2>/dev/null
+    kubectl exec -n submariner-operator "${TCPDUMP_POD}" --kubeconfig="${kubeconfig}" --context="${context}" -- cat /tmp/gateway-analysis.txt > "${tcpdump_dir}/${cluster_name}-gateway-${GATEWAY_NODE}-analysis.txt"
 
     # Check if files were extracted successfully
     if [ -f "${tcpdump_dir}/${cluster_name}-gateway-${GATEWAY_NODE}.pcap" ]; then
@@ -846,6 +849,10 @@ echo ""
 
 mkdir -p "${OUTPUT_DIR}"
 
+# Set up collection logging - capture all output to both console and log file
+COLLECTION_LOG="${OUTPUT_DIR}/collection.log"
+exec > >(tee -a "${COLLECTION_LOG}") 2>&1
+
 COLLECTION_START_TIME=$(date +%s)
 echo "========================================="
 echo "Collecting Submariner diagnostics..."
@@ -854,6 +861,8 @@ echo "========================================="
 echo ""
 echo "Timestamp: ${TIMESTAMP}" > "${OUTPUT_DIR}/manifest.txt"
 echo "Complaint: ${COMPLAINT}" >> "${OUTPUT_DIR}/manifest.txt"
+echo "" >> "${OUTPUT_DIR}/manifest.txt"
+echo "Collection Log: See collection.log for detailed output and any errors" >> "${OUTPUT_DIR}/manifest.txt"
 echo "" >> "${OUTPUT_DIR}/manifest.txt"
 
 # Document context renaming if it occurred

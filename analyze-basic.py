@@ -37,6 +37,8 @@ class SubmarinerAnalyzer:
         self.verify_tests_passed = False  # Track if verify tests passed
         self.routeagent_data = {}  # Store RouteAgent analysis data
         self.network_topology = {}  # Store network topology analysis
+        self.collection_errors = []  # Track collection-time errors
+        self.collection_failed = False  # Flag if collection had critical errors
 
     def extract_tarball(self):
         """Extract tarball to temporary directory"""
@@ -805,6 +807,7 @@ class SubmarinerAnalyzer:
 
         if not gateway1 and not gateway2:
             print(f"  {Colors.WARNING}⚠{Colors.ENDC} Could not read Gateway CRs")
+            print("     Possible cause: subctl gather failed (check collection.log for details)")
             return
 
         # Analyze cluster1
@@ -814,6 +817,53 @@ class SubmarinerAnalyzer:
         # Analyze cluster2
         if gateway2:
             self.analyze_gateway_blocking(gateway2, "cluster2")
+
+    def check_collection_errors(self):
+        """Check collection.log for critical errors that prevented data collection"""
+        collection_log_path = os.path.join(self.diagnostics_dir, "collection.log")
+        if not os.path.exists(collection_log_path):
+            return  # No collection.log (old diagnostic format)
+
+        collection_log = self.read_file("collection.log")
+        if not collection_log:
+            return
+
+        errors_found = []
+
+        # Check for subctl gather failures
+        if "Error creating directory" in collection_log and "Nom de répertoire non valide" in collection_log:
+            errors_found.append("subctl gather failed: Invalid directory name (Windows path issue with colons)")
+            errors_found.append("  → Context names with colons (:) cause errors on Windows")
+            errors_found.append("  → Re-collect from Linux, or use context names without special characters")
+        elif "Error creating directory" in collection_log:
+            errors_found.append("subctl gather failed: Error creating directory")
+
+        # Check for tcpdump collection failures
+        if "Failed to deploy tcpdump DaemonSet" in collection_log:
+            errors_found.append("tcpdump collection failed: Could not deploy DaemonSet")
+        if "tcpdump pod not found" in collection_log:
+            errors_found.append("tcpdump collection failed: Pod not found on gateway node")
+        if "Failed to extract files" in collection_log:
+            errors_found.append("tcpdump collection failed: Could not extract pcap/analysis files")
+
+        # Check for pod readiness timeouts
+        if "Pod did not become ready within 30s" in collection_log:
+            errors_found.append("tcpdump pod readiness timeout (may indicate image pull or scheduling issues)")
+
+        if errors_found:
+            # Store errors in state
+            self.collection_errors = errors_found
+            self.collection_failed = True
+
+            print(f"\n{Colors.FAIL}{'='*60}{Colors.ENDC}")
+            print(f"{Colors.FAIL}⚠ DATA COLLECTION ERRORS DETECTED{Colors.ENDC}")
+            print(f"{Colors.FAIL}{'='*60}{Colors.ENDC}")
+            print(f"\n{Colors.WARNING}The following errors occurred during data collection:{Colors.ENDC}\n")
+            for error in errors_found:
+                print(f"  • {error}")
+            print(f"\n{Colors.WARNING}Analysis results may be incomplete or inaccurate.{Colors.ENDC}")
+            print(f"{Colors.WARNING}Check collection.log for full details.{Colors.ENDC}")
+            print(f"{Colors.FAIL}{'='*60}{Colors.ENDC}\n")
 
     def find_and_read_gateway_cr(self, cluster):
         """Find and read the Gateway CR YAML"""
@@ -2173,6 +2223,9 @@ class SubmarinerAnalyzer:
             print(f"\n{Colors.BOLD}Diagnostic Information:{Colors.ENDC}")
             print(f"  Timestamp: {manifest.get('Timestamp', 'unknown')}")
             print(f"  Issue: {manifest.get('Complaint', 'unknown')}")
+
+        # Check for collection errors
+        self.check_collection_errors()
 
         # Check for faulty states first
         has_faults = self.check_faulty_states()

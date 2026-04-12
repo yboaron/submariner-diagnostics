@@ -170,6 +170,7 @@ Code.
 
 ### Always Collected
 
+- `collection.log` - Complete collection output including any errors
 - `subctl gather` - Comprehensive cluster data including:
   - Submariner CRs (Gateway, Endpoints, RouteAgents)
   - Pod logs and status
