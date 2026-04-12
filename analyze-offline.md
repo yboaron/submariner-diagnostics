@@ -93,6 +93,7 @@ options.
 ```text
 diagnostics-dir/
 ├── manifest.txt (contains timestamp, complaint, kubeconfig info)
+├── collection.log (complete collection output, check for errors)
 ├── cluster1/
 │   ├── gather/ (subctl gather output)
 │   │   └── cluster*/ (cluster-specific data)
@@ -132,6 +133,19 @@ diagnostics-dir/
 - Extract complaint (if not provided by user)
 - Note which clusters were collected
 - Check for context name handling (if overlapping contexts were auto-fixed)
+
+#### Check collection.log for errors
+
+If diagnostic data appears incomplete (missing gather data, empty tcpdump files,
+etc.), check `collection.log` for error messages:
+
+- `subctl gather` failures (e.g., Windows path issues with colons in names)
+- tcpdump DaemonSet creation failures
+- kubectl exec file extraction errors
+- Pod readiness timeouts
+
+The collection log contains the complete output of the collection process and is
+essential for troubleshooting collection issues.
 
 #### Check for Submariner Deployment
 
