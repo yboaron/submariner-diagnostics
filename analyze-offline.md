@@ -42,6 +42,21 @@ user does NOT have live cluster access.
 - Only use `subctl show/diagnose/verify` for VERIFICATION after fixes
 - NEVER recommend `subctl deploy-broker` or `subctl join`
 
+### 6. Check for Asymmetric Tunnel Status FIRST
+
+- **CRITICAL:** Before concluding infrastructure/firewall blocking, check if
+  tunnel status is asymmetric
+- Asymmetric = one cluster shows "connected", the other shows value other than
+  "connected"
+- If asymmetric: May indicate routing issues, though one-way infrastructure
+  filtering remains possible
+- **SNAT issues:** Only mention if CNI is OVN-Kubernetes (local gateway mode may
+  cause SNAT issues)
+- Use cautious language: "could be", "worth checking", "might be related to"
+- If cluster1→cluster2 tunnel is "connected", tunnel traffic appears able to reach
+  that side, but worth checking return-path filtering and asymmetric ACL/NAT/firewall
+  issues
+
 ## Your Role
 
 Analyze the diagnostic data (tarball or directory) and provide root cause
@@ -837,6 +852,93 @@ If cluster1 analysis shows packets (Out direction) BUT cluster2 analysis shows
           → Gateway not sending packets
           → Check gateway pod logs for cable driver initialization errors
 ```
+
+#### Pattern 4: Asymmetric Tunnel Status
+
+```text
+Cluster1 tunnel status: "connected"
+Cluster2 tunnel status: value other than "connected"
+(or vice versa)
+
+→ Asymmetric tunnel status detected
+→ This could indicate a routing/SNAT issue, but one-way infrastructure filtering remains possible
+→ If cluster1→cluster2 is connected, tunnel traffic appears able to reach that side
+→ Possible causes: return-path routing issue, SNAT modifying source IP, or asymmetric ACL/NAT/firewall filtering
+```
+
+#### Diagnosis for Asymmetric Status
+
+##### Step 1: Check CNI Type
+
+Read Gateway CR from both clusters:
+
+```bash
+cluster*/gather/cluster*/submariners_submariner-operator_submariner.yaml
+```
+
+Look for `status.networkPlugin` field:
+
+```yaml
+status:
+  networkPlugin: OVNKubernetes  # or Calico, etc.
+```
+
+##### Step 2: Analyze Based on CNI
+
+**If CNI is OVN-Kubernetes:**
+
+This could be related to SNAT issues in OVN-Kubernetes local gateway mode. In
+this mode, health check traffic from `ovn-k8s-mp0` interface may be SNAT'd to
+the node IP, breaking XFRM policy match.
+
+**Recommended Next Steps:**
+
+1. Check if diagnostic data contains OVN gateway mode configuration:
+
+```bash
+# Check if gateway mode info is available in collected data
+# (This information may not be in current collection; if not available,
+# proceed to step 2 and note the limitation)
+grep -i "gateway.*mode\|gatewayConfig" cluster*/gather/cluster*/*.log
+```
+
+Note: If gateway mode configuration is not available in the collected diagnostics,
+you can infer behavior from routing configuration (see step 2 below) but cannot
+definitively confirm local vs shared gateway mode.
+
+1. If local gateway mode is confirmed, this is a known issue. Workaround options:
+   - Switch to shared gateway mode (requires cluster reconfiguration)
+   - Apply nftables priority adjustment (advanced, requires testing)
+
+**If CNI is NOT OVN-Kubernetes:**
+
+This could be a routing configuration issue on the gateway node showing "error"
+status.
+
+**Recommended Next Steps:**
+
+1. Check routing table on the gateway node:
+
+```bash
+# From cluster*/gather/cluster*/<gateway-node>_ip-routes-table150.log
+```
+
+Verify routes exist for remote cluster CIDRs.
+
+1. Check health check IP configuration:
+
+```bash
+# From cluster*/gather/cluster*/<gateway-node>_ip-a.log
+```
+
+Search for the health check IP (from Gateway CR).
+
+**Important Notes:**
+
+- Asymmetric status suggests tunnel traffic can pass in at least one direction
+- The cluster showing "connected" appears able to reach the other cluster
+- The issue could be return-path routing, source IP modification, or asymmetric ACL/NAT/firewall filtering
+- Use cautious language: "could be", "worth checking", "might be related to"
 
 #### **Analysis 2: MTU Issues**
 

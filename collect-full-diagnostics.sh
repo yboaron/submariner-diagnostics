@@ -169,22 +169,44 @@ collect_tcpdump_from_cluster() {
     # Get Submariner configuration to determine capture filter
     CABLE_DRIVER=$(kubectl get submariner submariner -n submariner-operator --kubeconfig="${kubeconfig}" --context="${context}" -o jsonpath='{.spec.cableDriver}' 2>/dev/null)
     CABLE_DRIVER=${CABLE_DRIVER:-libreswan}  # Default to libreswan if not set
-    USING_IP=$(kubectl get submariner submariner -n submariner-operator --kubeconfig="${kubeconfig}" --context="${context}" -o jsonpath='{.status.gateways[0].connections[0].usingIP}' 2>/dev/null)
-    PRIVATE_IP=$(kubectl get submariner submariner -n submariner-operator --kubeconfig="${kubeconfig}" --context="${context}" -o jsonpath='{.status.gateways[0].connections[0].endpoint.private_ip}' 2>/dev/null)
+
+    # Get USING_IP and PRIVATE_IP from the active gateway (matching ACTIVE_GATEWAY_HOSTNAME)
+    # This ensures we capture the correct protocol (ESP vs NAT-T) for the active tunnel
+    if [ -n "$ACTIVE_GATEWAY_HOSTNAME" ]; then
+        USING_IP=$(kubectl get submariner submariner -n submariner-operator --kubeconfig="${kubeconfig}" --context="${context}" -o jsonpath="{.status.gateways[?(@.localEndpoint.hostname==\"${ACTIVE_GATEWAY_HOSTNAME}\")].connections[0].usingIP}" 2>/dev/null)
+        PRIVATE_IP=$(kubectl get submariner submariner -n submariner-operator --kubeconfig="${kubeconfig}" --context="${context}" -o jsonpath="{.status.gateways[?(@.localEndpoint.hostname==\"${ACTIVE_GATEWAY_HOSTNAME}\")].connections[0].endpoint.private_ip}" 2>/dev/null)
+    fi
+
+    # Fall back to first gateway if active gateway lookup failed
+    if [ -z "$USING_IP" ] || [ -z "$PRIVATE_IP" ]; then
+        USING_IP=$(kubectl get submariner submariner -n submariner-operator --kubeconfig="${kubeconfig}" --context="${context}" -o jsonpath='{.status.gateways[0].connections[0].usingIP}' 2>/dev/null)
+        PRIVATE_IP=$(kubectl get submariner submariner -n submariner-operator --kubeconfig="${kubeconfig}" --context="${context}" -o jsonpath='{.status.gateways[0].connections[0].endpoint.private_ip}' 2>/dev/null)
+    fi
+
     FORCE_UDP=$(kubectl get submariner submariner -n submariner-operator --kubeconfig="${kubeconfig}" --context="${context}" -o jsonpath='{.spec.ceIPSecForceUDPEncaps}' 2>/dev/null)
     NATT_PORT=$(kubectl get submariner submariner -n submariner-operator --kubeconfig="${kubeconfig}" --context="${context}" -o jsonpath='{.spec.ceIPSecNATTPort}' 2>/dev/null)
     NATT_PORT=${NATT_PORT:-4500}  # Default to 4500 if not set
 
-    # Determine capture filter based on cable driver and configuration
+    # Determine capture filters based on cable driver and configuration
+    # Separate tunnel traffic from ICMP for accurate analysis
     if [ "$CABLE_DRIVER" = "vxlan" ]; then
-        CAPTURE_FILTER="udp port ${NATT_PORT}"
-        echo "  Capture filter: ${CAPTURE_FILTER} (VXLAN cable driver)"
+        CAPTURE_FILTER_TUNNEL="udp port ${NATT_PORT}"
+        CAPTURE_FILTER_ICMP="icmp"
+        CAPTURE_FILTER="${CAPTURE_FILTER_TUNNEL} or ${CAPTURE_FILTER_ICMP}"
+        echo "  Capture filter (tunnel): ${CAPTURE_FILTER_TUNNEL} (VXLAN cable driver)"
+        echo "  Capture filter (ICMP): ${CAPTURE_FILTER_ICMP} (health check diagnostics)"
     elif [ "$FORCE_UDP" = "true" ] || [ "$USING_IP" != "$PRIVATE_IP" ]; then
-        CAPTURE_FILTER="udp port ${NATT_PORT}"
-        echo "  Capture filter: ${CAPTURE_FILTER} (UDP encapsulation detected)"
+        CAPTURE_FILTER_TUNNEL="udp port ${NATT_PORT}"
+        CAPTURE_FILTER_ICMP="icmp"
+        CAPTURE_FILTER="${CAPTURE_FILTER_TUNNEL} or ${CAPTURE_FILTER_ICMP}"
+        echo "  Capture filter (tunnel): ${CAPTURE_FILTER_TUNNEL} (UDP encapsulation)"
+        echo "  Capture filter (ICMP): ${CAPTURE_FILTER_ICMP} (health check diagnostics)"
     else
-        CAPTURE_FILTER="proto 50"
-        echo "  Capture filter: ${CAPTURE_FILTER} (ESP protocol)"
+        CAPTURE_FILTER_TUNNEL="proto 50"
+        CAPTURE_FILTER_ICMP="icmp"
+        CAPTURE_FILTER="${CAPTURE_FILTER_TUNNEL} or ${CAPTURE_FILTER_ICMP}"
+        echo "  Capture filter (tunnel): ${CAPTURE_FILTER_TUNNEL} (ESP protocol)"
+        echo "  Capture filter (ICMP): ${CAPTURE_FILTER_ICMP} (health check diagnostics)"
     fi
 
     # Create DaemonSet YAML for tcpdump
@@ -217,7 +239,7 @@ spec:
         - -c
         - |
           echo "Starting tcpdump capture for ${capture_duration} seconds..."
-          timeout ${capture_duration} tcpdump -pnni any ${CAPTURE_FILTER} -w /tmp/gateway-traffic.pcap 2>&1
+          timeout ${capture_duration} tcpdump -pnni any "${CAPTURE_FILTER}" -w /tmp/gateway-traffic.pcap 2>&1
           echo "Capture complete. Generating analysis..."
 
           # Generate analysis text file inside the container
@@ -225,25 +247,42 @@ spec:
             echo "========================================="
             echo "TCPDUMP CAPTURE SUMMARY: ${cluster_name} Gateway"
             echo "Node: ${GATEWAY_NODE}"
-            echo "Capture Filter: ${CAPTURE_FILTER}"
+            echo "Capture Filter (tunnel): ${CAPTURE_FILTER_TUNNEL}"
+            echo "Capture Filter (ICMP): ${CAPTURE_FILTER_ICMP}"
             echo "Capture Duration: ${capture_duration} seconds"
             echo "========================================="
             echo ""
 
             # Count total packets
             TOTAL_PACKETS=\$(tcpdump -r /tmp/gateway-traffic.pcap -nn 2>/dev/null | wc -l)
+
+            # Count tunnel packets only (excluding ICMP)
+            TUNNEL_PACKETS=\$(tcpdump -r /tmp/gateway-traffic.pcap -nn "${CAPTURE_FILTER_TUNNEL}" 2>/dev/null | wc -l)
+
+            # Count ICMP packets
+            ICMP_PACKETS=\$(tcpdump -r /tmp/gateway-traffic.pcap -nn "${CAPTURE_FILTER_ICMP}" 2>/dev/null | wc -l)
+
             echo "CAPTURE STATISTICS:"
             echo "  Total packets captured: \${TOTAL_PACKETS}"
+            echo "  Tunnel packets (${CAPTURE_FILTER_TUNNEL}): \${TUNNEL_PACKETS}"
+            echo "  ICMP packets: \${ICMP_PACKETS}"
             echo ""
 
-            # Show first 50 packets with details
-            echo "FIRST 50 PACKETS (detailed):"
-            tcpdump -r /tmp/gateway-traffic.pcap -nnv 2>/dev/null | head -50
+            # Show first 50 packets with details (tunnel traffic only for analysis)
+            echo "FIRST 50 TUNNEL PACKETS (detailed):"
+            tcpdump -r /tmp/gateway-traffic.pcap -nnv "${CAPTURE_FILTER_TUNNEL}" 2>/dev/null | head -50
             echo ""
 
-            # Show unique source/destination pairs (using sed instead of awk for busybox compatibility)
-            echo "UNIQUE SOURCE -> DESTINATION PAIRS:"
-            tcpdump -r /tmp/gateway-traffic.pcap -nnq 2>/dev/null | sed -n 's/^.* \\([^ ]*\\) > \\([^ :]*\\).*/\\1 -> \\2/p' | sort | uniq -c | sort -rn
+            # Show unique source/destination pairs for tunnel traffic
+            echo "UNIQUE SOURCE -> DESTINATION PAIRS (tunnel traffic):"
+            tcpdump -r /tmp/gateway-traffic.pcap -nnq "${CAPTURE_FILTER_TUNNEL}" 2>/dev/null | sed -n 's/^.* \\([^ ]*\\) > \\([^ :]*\\).*/\\1 -> \\2/p' | sort | uniq -c | sort -rn
+            echo ""
+
+            # Optionally show ICMP summary
+            if [ "\${ICMP_PACKETS}" -gt 0 ]; then
+              echo "ICMP PACKET SUMMARY:"
+              tcpdump -r /tmp/gateway-traffic.pcap -nnq "${CAPTURE_FILTER_ICMP}" 2>/dev/null | head -20
+            fi
 
           } > /tmp/gateway-analysis.txt 2>&1
 
@@ -1232,11 +1271,12 @@ echo "Tunnel status:"
 echo "  Cluster1: ${TUNNEL_STATUS_CLUSTER1}"
 echo "  Cluster2: ${TUNNEL_STATUS_CLUSTER2}"
 
-# Skip subctl verify entirely if tunnel is not connected on BOTH clusters
-if [ "$TUNNEL_STATUS_CLUSTER1" != "connected" ] || [ "$TUNNEL_STATUS_CLUSTER2" != "connected" ]; then
+# Skip subctl verify only if tunnel is not connected on BOTH clusters
+# If one tunnel is connected but the other is not, we still run verification to diagnose the asymmetry
+if [ "$TUNNEL_STATUS_CLUSTER1" != "connected" ] && [ "$TUNNEL_STATUS_CLUSTER2" != "connected" ]; then
     echo ""
-    echo "  ✗ Tunnel NOT connected on both clusters - skipping 'subctl verify'"
-    echo "  → Reason: Need to fix tunnel connectivity first before running verify tests"
+    echo "  ✗ Tunnel NOT connected on either cluster - skipping 'subctl verify'"
+    echo "  → Reason: Need to establish basic tunnel connectivity first"
     echo "  → Alternative: tcpdump data provides packet-level diagnostics (see tcpdump/ directory)"
     echo ""
 
@@ -1245,15 +1285,15 @@ if [ "$TUNNEL_STATUS_CLUSTER1" != "connected" ] || [ "$TUNNEL_STATUS_CLUSTER2" !
     echo "CONNECTIVITY VERIFICATION SKIPPED" >> "${OUTPUT_DIR}/verify/connectivity.txt"
     echo "========================================" >> "${OUTPUT_DIR}/verify/connectivity.txt"
     echo "" >> "${OUTPUT_DIR}/verify/connectivity.txt"
-    echo "Connectivity verification was skipped because tunnel status is not 'connected' on both clusters." >> "${OUTPUT_DIR}/verify/connectivity.txt"
+    echo "Connectivity verification was skipped because tunnel status is not 'connected' on either cluster." >> "${OUTPUT_DIR}/verify/connectivity.txt"
     echo "" >> "${OUTPUT_DIR}/verify/connectivity.txt"
     echo "Tunnel status:" >> "${OUTPUT_DIR}/verify/connectivity.txt"
     echo "  Cluster1: ${TUNNEL_STATUS_CLUSTER1}" >> "${OUTPUT_DIR}/verify/connectivity.txt"
     echo "  Cluster2: ${TUNNEL_STATUS_CLUSTER2}" >> "${OUTPUT_DIR}/verify/connectivity.txt"
     echo "" >> "${OUTPUT_DIR}/verify/connectivity.txt"
     echo "Why skipped:" >> "${OUTPUT_DIR}/verify/connectivity.txt"
-    echo "  - Tunnel must be 'connected' on BOTH clusters to run verify tests" >> "${OUTPUT_DIR}/verify/connectivity.txt"
-    echo "  - Focus should be on fixing tunnel connectivity first" >> "${OUTPUT_DIR}/verify/connectivity.txt"
+    echo "  - Both tunnels are not connected - no connectivity possible" >> "${OUTPUT_DIR}/verify/connectivity.txt"
+    echo "  - Focus should be on establishing basic tunnel connectivity first" >> "${OUTPUT_DIR}/verify/connectivity.txt"
     echo "  - tcpdump packet captures (if collected) provide better diagnostics for tunnel failures" >> "${OUTPUT_DIR}/verify/connectivity.txt"
     echo "" >> "${OUTPUT_DIR}/verify/connectivity.txt"
     echo "Recommended diagnostics for tunnel failures:" >> "${OUTPUT_DIR}/verify/connectivity.txt"
@@ -1268,7 +1308,7 @@ if [ "$TUNNEL_STATUS_CLUSTER1" != "connected" ] || [ "$TUNNEL_STATUS_CLUSTER2" !
 
     # Skip the entire verify section
     SKIP_VERIFY=true
-else
+elif [ "$TUNNEL_STATUS_CLUSTER1" = "connected" ] && [ "$TUNNEL_STATUS_CLUSTER2" = "connected" ]; then
     echo ""
     echo "  ✓ Tunnel status: connected on BOTH clusters"
     echo "  → Will run full connectivity verification tests (including MTU test)"
@@ -1276,6 +1316,15 @@ else
     SKIP_VERIFY=false
     VERIFY_CONNECTIVITY_FLAG="connectivity"
     RUN_MTU_TEST=true
+else
+    echo ""
+    echo "  ⚠ Asymmetric tunnel status detected (connected on one cluster, not on the other)"
+    echo "  → Will run connectivity verification to diagnose the issue"
+    echo "  → Note: This may indicate a SNAT or routing issue affecting one direction"
+
+    SKIP_VERIFY=false
+    VERIFY_CONNECTIVITY_FLAG="connectivity"
+    RUN_MTU_TEST=false
 fi
 
 # Only run verify tests if tunnel is connected on at least one cluster
@@ -1632,22 +1681,27 @@ if [ "$SKIP_VERIFY" = "false" ]; then
         # First check if test passed (avoid false positives from "0 Failed" in success summaries)
         if grep -qE 'SUCCESS!|[0-9]+\s+Passed.*0\s+Failed' "${OUTPUT_DIR}/verify/connectivity.txt" 2>/dev/null; then
             CONNECTIVITY_FAILED=false
-        # Only if not successful, check for actual failures
-        elif grep -qE 'FAIL\b|timed out|stopped early|[1-9][0-9]*\s+Failed' "${OUTPUT_DIR}/verify/connectivity.txt" 2>/dev/null; then
+        # Only if not successful, check for actual failures (including timeouts)
+        elif grep -qE 'FAIL\b|timed out|terminated after|stopped early|[1-9][0-9]*\s+Failed' "${OUTPUT_DIR}/verify/connectivity.txt" 2>/dev/null; then
             CONNECTIVITY_FAILED=true
         fi
     fi
 
     # Check if small packet tests also failed (to rule out MTU issues)
     SMALL_PACKET_FAILED=false
+    SMALL_PACKET_STATUS="not-run"
     if [ -f "${OUTPUT_DIR}/verify/connectivity-small-packet.txt" ]; then
         # Check if test was actually run (not skipped)
-        if ! grep -qE "SKIPPED|MTU TEST SKIPPED|SMALL PACKET TEST SKIPPED" "${OUTPUT_DIR}/verify/connectivity-small-packet.txt" 2>/dev/null; then
+        if grep -qE "SKIPPED|MTU TEST SKIPPED|SMALL PACKET TEST SKIPPED" "${OUTPUT_DIR}/verify/connectivity-small-packet.txt" 2>/dev/null; then
+            SMALL_PACKET_STATUS="skipped"
+        else
             # Test was run - check if it failed (avoid false positives from "0 Failed" in success summaries)
             if grep -qE 'SUCCESS!|[0-9]+\s+Passed.*0\s+Failed' "${OUTPUT_DIR}/verify/connectivity-small-packet.txt" 2>/dev/null; then
+                SMALL_PACKET_STATUS="passed"
                 SMALL_PACKET_FAILED=false
-            # Only if not successful, check for actual failures
-            elif grep -qE 'FAIL\b|timed out|stopped early|[1-9][0-9]*\s+Failed' "${OUTPUT_DIR}/verify/connectivity-small-packet.txt" 2>/dev/null; then
+            # Only if not successful, check for actual failures (including timeouts)
+            elif grep -qE 'FAIL\b|timed out|terminated after|stopped early|[1-9][0-9]*\s+Failed' "${OUTPUT_DIR}/verify/connectivity-small-packet.txt" 2>/dev/null; then
+                SMALL_PACKET_STATUS="failed"
                 SMALL_PACKET_FAILED=true
             fi
         fi
@@ -1714,9 +1768,14 @@ if [ "$SKIP_VERIFY" = "false" ]; then
         echo "  End time: $(date '+%Y-%m-%d %H:%M:%S')"
     elif [ "$CONNECTIVITY_FAILED" = "false" ]; then
         echo "  → Regular connectivity tests passed - no need for OVNK-specific test"
-    elif [ "$CONNECTIVITY_FAILED" = "true" ] && [ "$SMALL_PACKET_FAILED" = "false" ]; then
+    elif [ "$CONNECTIVITY_FAILED" = "true" ] && [ "$SMALL_PACKET_STATUS" = "passed" ]; then
         echo "  → Small packet test passed but regular failed - this is an MTU issue, not OVNK SNAT"
         echo "     Skipping OVNK-specific test (MTU issue already detected)"
+    elif [ "$CONNECTIVITY_FAILED" = "true" ] && [ "$SMALL_PACKET_STATUS" = "skipped" ]; then
+        echo "  → Small packet test was skipped - cannot classify this as MTU or OVNK SNAT from this run"
+        echo "     In asymmetric tunnel cases, review routing/SNAT guidance and rerun with --skip-src-ip-check if needed"
+    elif [ "$CONNECTIVITY_FAILED" = "true" ] && [ "$SMALL_PACKET_STATUS" = "not-run" ]; then
+        echo "  → Small packet test did not run - cannot classify this as MTU or OVNK SNAT from this run"
     elif [ "$OVNK_DETECTED" = "false" ]; then
         echo "  → OVNK CNI not detected - skipping OVNK-specific test"
     else
