@@ -262,6 +262,30 @@ Based on the complaint, route to appropriate analysis:
 - **Endpoint Consistency** - All clusters should see the same Endpoint resources
   - Both clusters should have consistent view of remote endpoints
   - Inconsistency may indicate broker or network issues
+- **OVN-Kubernetes Local Gateway Mode Issue** - Check for known health check
+  issue with OVN-K
+  - **Detection criteria:**
+    1. CNI is OVN-Kubernetes AND local gateway mode is detected
+       - Files: `cluster*/gather/cluster*/<node>_ip-a.log` - Check if ALL nodes
+         have `breth0` interface
+       - Files: `cluster*/gather/cluster*/<node>_ovn_logical_routers.log` - Check
+         if ALL nodes have `GR_<nodename>` router
+       - If ALL nodes have both → Local gateway mode (vs. only gateway nodes in
+         shared mode)
+    2. Gateway CR shows `status: error` with "Failed to successfully ping" message
+    3. (Optional) RouteAgent CR shows `status: connected` despite Gateway error
+  - **Important:** This appears to be a known issue (submariner-io/submariner#3857)
+    where OVN's pod-subnet masquerade may interfere with health checks
+  - **Language to use:** "This configuration might be affected by", "appears
+    similar to", "could be related to"
+  - **If detected:** Point to known issue and community workaround, but note that
+    the workaround should be evaluated carefully
+  - **References:**
+    - Issue: <https://github.com/submariner-io/submariner/issues/3857>
+    - Workaround:
+      <https://github.com/yboaron/submariner-workarounds/tree/main/ovn-local-gateway-health-check>
+  - **Note:** Detection can proceed even if criterion #3 (RouteAgent status) is
+    not met
 
 #### Common complaints and their focus areas
 
@@ -887,28 +911,67 @@ status:
 
 **If CNI is OVN-Kubernetes:**
 
-This could be related to SNAT issues in OVN-Kubernetes local gateway mode. In
-this mode, health check traffic from `ovn-k8s-mp0` interface may be SNAT'd to
-the node IP, breaking XFRM policy match.
+This configuration might be affected by a known issue with OVN-Kubernetes in local
+gateway mode (submariner-io/submariner#3857). In this mode, OVN's pod-subnet
+masquerade rule may interfere with Submariner health check traffic.
+
+##### Step 2a: Detect OVN-Kubernetes Gateway Mode
+
+Check if the cluster is running in **local gateway mode** (all nodes act as gateways)
+vs **shared gateway mode** (only designated nodes):
+
+```bash
+# Method 1: Check for breth0 interface on ALL nodes
+# In local mode: ALL nodes have breth0
+# In shared mode: Only gateway nodes have breth0
+grep -h "^[0-9]*: breth0:" cluster*/gather/cluster*/*_ip-a.log | wc -l
+# Compare count with total number of nodes (ls cluster*/gather/cluster*/*_ip-a.log | wc -l)
+
+# Method 2: Check for per-node gateway routers (GR_)
+# In local mode: ALL nodes have GR_<nodename> router
+# In shared mode: Only gateway nodes have GR_ routers
+grep -h "^name.*: GR_" cluster*/gather/cluster*/*_ovn_logical_routers.log | wc -l
+# Compare with total number of nodes
+```
+
+**Detection Logic:**
+
+If `breth0_count == total_nodes` → **Local gateway mode** (all nodes have breth0)
+If `breth0_count < total_nodes` → **Shared gateway mode** (only some nodes)
+
+##### Step 2b: Check for Gateway vs RouteAgent Status Discrepancy
+
+If local gateway mode is detected, also check:
+
+```bash
+# Check Gateway CR status
+grep -A5 "status:" cluster*/gather/cluster*/gateways_submariner-operator_*.yaml | grep "status:"
+
+# Check RouteAgent CR status
+grep -A30 "status:" cluster*/gather/cluster*/routeagents_*.yaml | grep "status:"
+```
+
+If you find:
+
+- Gateway CR: `status: error` with "Failed to successfully ping" message
+- RouteAgent CR: `status: connected`
+- Both clusters in local gateway mode
+
+→ This appears similar to the known OVN local gateway issue (submariner-io/submariner#3857)
 
 **Recommended Next Steps:**
 
-1. Check if diagnostic data contains OVN gateway mode configuration:
+1. Reference the known issue: <https://github.com/submariner-io/submariner/issues/3857>
+2. A community workaround is available (use cautious language):
+   - Workaround repository:
+     <https://github.com/yboaron/submariner-workarounds/tree/main/ovn-local-gateway-health-check>
+   - **Important:** This is a workaround, not an official fix
+   - Review and test thoroughly before applying
+   - Consider potential side effects
+3. Alternative: Switch to shared gateway mode (requires cluster reconfiguration)
 
-```bash
-# Check if gateway mode info is available in collected data
-# (This information may not be in current collection; if not available,
-# proceed to step 2 and note the limitation)
-grep -i "gateway.*mode\|gatewayConfig" cluster*/gather/cluster*/*.log
-```
-
-Note: If gateway mode configuration is not available in the collected diagnostics,
-you can infer behavior from routing configuration (see step 2 below) but cannot
-definitively confirm local vs shared gateway mode.
-
-1. If local gateway mode is confirmed, this is a known issue. Workaround options:
-   - Switch to shared gateway mode (requires cluster reconfiguration)
-   - Apply nftables priority adjustment (advanced, requires testing)
+**Note:** Use cautious language when suggesting this: "This configuration appears
+similar to", "might be related to", "could potentially be addressed by"
 
 **If CNI is NOT OVN-Kubernetes:**
 

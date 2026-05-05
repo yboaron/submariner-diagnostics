@@ -2361,6 +2361,136 @@ class SubmarinerAnalyzer:
             else:
                 print(f"  {Colors.WARNING}⚠{Colors.ENDC} {cluster}: Could not determine active gateway node")
 
+    def check_ovn_local_gateway_mode_issue(self):
+        """
+        Check for known OVN-Kubernetes local gateway mode health check issue.
+
+        Detection criteria:
+        1. CNI is OVN-Kubernetes AND local gateway mode is detected
+        2. Gateway CR shows status: error with "Failed to successfully ping"
+        3. (Optional) RouteAgent CR shows status: connected despite Gateway error
+
+        Reference: https://github.com/submariner-io/submariner/issues/3857
+        """
+        print(f"\n{Colors.BOLD}=== Checking for OVN-K Local Gateway Mode Issue ==={Colors.ENDC}")
+
+        # Detect CNI for both clusters
+        cni_cluster1 = self.detect_cni("cluster1")
+        cni_cluster2 = self.detect_cni("cluster2")
+
+        if "OVN" not in cni_cluster1 and "OVN" not in cni_cluster2:
+            print(f"  {Colors.OKBLUE}ℹ{Colors.ENDC} CNI is not OVN-Kubernetes - skipping OVN local gateway mode check")
+            return
+
+        # Method 1: Check for breth0 interface on ALL nodes
+        cluster_subdirs = self.get_cluster_subdirs()
+        if not cluster_subdirs:
+            return
+
+        for cluster in ['cluster1', 'cluster2']:
+            actual_cluster_name = cluster_subdirs.get(cluster)
+            if not actual_cluster_name:
+                continue
+
+            gather_dir = os.path.join(self.diagnostics_dir, cluster, "gather", actual_cluster_name)
+            if not os.path.exists(gather_dir):
+                continue
+
+            print(f"\n  Checking {cluster}...")
+
+            # Count nodes with breth0
+            breth0_count = 0
+            total_nodes = 0
+            ip_a_files = []
+
+            for file in os.listdir(gather_dir):
+                if file.endswith("_ip-a.log"):
+                    total_nodes += 1
+                    ip_a_files.append(file)
+                    content = self.read_file(os.path.join(cluster, "gather", actual_cluster_name, file))
+                    if content and re.search(r'^\d+: breth0:', content, re.MULTILINE):
+                        breth0_count += 1
+
+            # Determine gateway mode (local mode = all nodes have breth0)
+            if total_nodes == 0:
+                print(f"    {Colors.WARNING}⚠{Colors.ENDC} Could not determine node count")
+                continue
+
+            is_local_mode = (breth0_count == total_nodes)
+
+            if is_local_mode:
+                print(f"    {Colors.WARNING}⚠{Colors.ENDC} OVN-K gateway mode: LOCAL")
+                print(f"      - All {total_nodes} nodes have breth0 interface")
+
+                # Check Gateway CR status directly
+                gateway_status = 'unknown'
+                gateway_message = ''
+                gateway_files = [f for f in os.listdir(gather_dir) if f.startswith("gateways_")]
+                for gw_file in gateway_files:
+                    gw_content = self.read_file(os.path.join(cluster, "gather", actual_cluster_name, gw_file))
+                    if gw_content:
+                        try:
+                            gw_yaml = yaml.safe_load(gw_content)
+                            if gw_yaml and 'status' in gw_yaml and 'connections' in gw_yaml['status']:
+                                connections = gw_yaml['status']['connections']
+                                if isinstance(connections, list) and len(connections) > 0 and isinstance(connections[0], dict):
+                                    gateway_status = connections[0].get('status', 'unknown')
+                                    gateway_message = connections[0].get('statusMessage', '')
+                                    break
+                        except yaml.YAMLError:
+                            continue
+
+                # Check RouteAgent status
+                routeagent_status = None
+                routeagent_files = [f for f in os.listdir(gather_dir) if f.startswith("routeagents_")]
+                for ra_file in routeagent_files:
+                    content = self.read_file(os.path.join(cluster, "gather", actual_cluster_name, ra_file))
+                    if content:
+                        try:
+                            ra_yaml = yaml.safe_load(content)
+                            if ra_yaml and 'status' in ra_yaml:
+                                remote_endpoints = ra_yaml['status'].get('remoteEndpoints', [])
+                                if isinstance(remote_endpoints, list) and remote_endpoints and isinstance(remote_endpoints[0], dict):
+                                    routeagent_status = remote_endpoints[0].get('status', None)
+                                    if routeagent_status:
+                                        break
+                        except yaml.YAMLError:
+                            continue
+
+                # Check for the issue pattern
+                has_ping_failure = gateway_status == 'error' and 'ping' in str(gateway_message).lower()
+                has_ra_connected = routeagent_status == 'connected'
+
+                if has_ping_failure:
+                    print(f"    {Colors.FAIL}✗{Colors.ENDC} Gateway status: {gateway_status}")
+                    print(f"      Message: {gateway_message}")
+
+                    if has_ra_connected:
+                        print(f"    {Colors.WARNING}⚠{Colors.ENDC} RouteAgent status: {routeagent_status} (discrepancy!)")
+
+                    print(f"\n    {Colors.WARNING}⚠ POSSIBLE KNOWN ISSUE DETECTED:{Colors.ENDC}")
+                    print("      This configuration appears similar to a known issue with")
+                    print("      OVN-Kubernetes in local gateway mode.")
+                    print("")
+                    print(f"      {Colors.BOLD}References:{Colors.ENDC}")
+                    print("      • Issue: https://github.com/submariner-io/submariner/issues/3857")
+                    print("      • Community workaround: https://github.com/yboaron/submariner-workarounds/")
+                    print("        tree/main/ovn-local-gateway-health-check")
+                    print("")
+                    print(f"      {Colors.BOLD}Important:{Colors.ENDC} This is a community workaround, not an official fix.")
+                    print("      Review and test thoroughly before applying.")
+
+                    self.faulty_states.append(f"{cluster}: Possible OVN-K local gateway mode issue (health check failure)")
+                    self.issues.append(f"{cluster}: Configuration might be affected by OVN-K local gateway mode issue (#3857)")
+                    self.recommendations.append(f"{cluster}: Review known issue submariner-io/submariner#3857 and evaluate community workaround")
+                elif gateway_status == 'connected':
+                    print(f"    {Colors.OKGREEN}✓{Colors.ENDC} Gateway status: {gateway_status}")
+                else:
+                    print(f"    {Colors.WARNING}⚠{Colors.ENDC} Gateway status: {gateway_status} (but not 'ping' failure pattern)")
+            else:
+                print(f"    {Colors.OKBLUE}ℹ{Colors.ENDC} OVN-K gateway mode: SHARED (or not detected)")
+                print(f"      - {breth0_count}/{total_nodes} nodes have breth0 interface")
+
     def check_main_table_routes(self):
         """Check if main routing table has routes to remote cluster CIDRs"""
         print(f"\n{Colors.BOLD}=== Checking Main Routing Table ==={Colors.ENDC}")
@@ -2462,6 +2592,7 @@ class SubmarinerAnalyzer:
             cni_cluster2 = self.detect_cni("cluster2")
             if "OVN" in cni_cluster1 or "OVN" in cni_cluster2:
                 self.check_ovn_routing()
+                self.check_ovn_local_gateway_mode_issue()
                 self.check_main_table_routes()
 
             # Analyze tcpdump for tunnel issues
