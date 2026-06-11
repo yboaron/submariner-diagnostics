@@ -2,3 +2,9 @@
 line-length:
   line_length: 140
 no-duplicate-heading: false
+no-emphasis-as-heading: false
+no-inline-html: false
+fenced-code-language: false
+no-trailing-punctuation: false  # Allow colons in headings like "On Gateway Node:"
+blanks-around-lists: false      # Allow compact list formatting
+blanks-around-fences: false     # Allow compact code block formatting
