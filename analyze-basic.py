@@ -10,8 +10,8 @@ import tarfile
 import yaml
 import re
 import ipaddress
-from pathlib import Path
-from datetime import datetime
+import subprocess
+import json
 
 class Colors:
     """ANSI color codes for terminal output"""
@@ -37,13 +37,18 @@ class SubmarinerAnalyzer:
         self.verify_tests_passed = False  # Track if verify tests passed
         self.routeagent_data = {}  # Store RouteAgent analysis data
         self.network_topology = {}  # Store network topology analysis
+        self.collection_errors = []  # Track collection-time errors
+        self.collection_failed = False  # Flag if collection had critical errors
 
     def extract_tarball(self):
         """Extract tarball to temporary directory"""
         print(f"Extracting {self.tarball_path}...")
 
         if not os.path.exists(self.tarball_path):
-            print(f"{Colors.FAIL}ERROR: File not found: {self.tarball_path}{Colors.ENDC}")
+            print(
+                f"{Colors.FAIL}ERROR: File not found: "
+                f"{self.tarball_path}{Colors.ENDC}"
+            )
             return False
 
         try:
@@ -104,8 +109,23 @@ class SubmarinerAnalyzer:
         return manifest
 
     def detect_cni(self, cluster):
-        """Detect CNI plugin from summary.html"""
+        """Detect CNI plugin from Gateway CR or summary.html"""
+        # First try Gateway CR (more reliable)
+        gateway_cr = self.find_and_read_gateway_cr(cluster)
+        if gateway_cr and 'status' in gateway_cr:
+            network_plugin = gateway_cr['status'].get('networkPlugin')
+            if network_plugin:
+                return network_plugin
+
+        # Fallback to summary.html - try literal cluster path first
         summary_html = self.read_file(f"{cluster}/gather/{cluster}/summary.html")
+
+        # If that fails, try using get_cluster_subdirs() mapping
+        if not summary_html:
+            cluster_subdirs = self.get_cluster_subdirs()
+            actual_cluster_name = cluster_subdirs.get(cluster, cluster)
+            if actual_cluster_name != cluster:
+                summary_html = self.read_file(f"{cluster}/gather/{actual_cluster_name}/summary.html")
         if not summary_html:
             return "unknown"
 
@@ -115,6 +135,13 @@ class SubmarinerAnalyzer:
         if match:
             return match.group(1).strip()
         return "unknown"
+
+    def detect_globalnet(self, cluster):
+        """Detect if Globalnet is enabled from Submariner CR"""
+        submariner_cr = self.find_and_read_gateway_cr(cluster)
+        if submariner_cr and 'spec' in submariner_cr:
+            return submariner_cr['spec'].get('globalCIDR', '') != ''
+        return False
 
     def check_version_compatibility(self):
         """Check for version mismatches between subctl and Submariner"""
@@ -767,6 +794,47 @@ class SubmarinerAnalyzer:
         if status1['status'] == 'connected' and status2['status'] == 'connected':
             print(f"  {Colors.OKGREEN}✓{Colors.ENDC} Tunnels connected on both clusters")
         else:
+            # Check for asymmetric tunnel status (one connected, one not)
+            if (status1['status'] == 'connected' and status2['status'] != 'connected') or \
+               (status2['status'] == 'connected' and status1['status'] != 'connected'):
+                # Detect CNI to provide more specific guidance
+                cni_cluster1 = self.detect_cni("cluster1")
+                cni_cluster2 = self.detect_cni("cluster2")
+                is_ovnk = ("OVNKubernetes" in [cni_cluster1, cni_cluster2])
+
+                # Determine which cluster is degraded and its actual status
+                degraded_cluster = "Cluster1" if status1['status'] != 'connected' else "Cluster2"
+                degraded_status = status1['status'] if status1['status'] != 'connected' else status2['status']
+
+                print(f"\n  {Colors.WARNING}⚠ ASYMMETRIC TUNNEL STATUS DETECTED{Colors.ENDC}")
+                print(f"    One tunnel shows 'connected' while {degraded_cluster} shows '{degraded_status}'")
+                print(f"    CNI detected: Cluster1={cni_cluster1}, Cluster2={cni_cluster2}")
+                print("    This pattern could indicate:")
+
+                if is_ovnk:
+                    print("      • SNAT issues affecting health check packets (OVN-K local gateway mode is known to cause this)")
+                    print("      • Routing issues on one cluster's gateway node")
+                    print("      • Firewall/infrastructure blocking traffic asymmetrically (less likely)")
+                else:
+                    print("      • Routing issues on one cluster's gateway node")
+                    print("      • Firewall/infrastructure blocking traffic asymmetrically")
+                    print("      • CNI configuration differences between clusters")
+
+                self.issues.append("Asymmetric tunnel status - one connected, one not (possible SNAT/routing/firewall issue)")
+
+                if is_ovnk:
+                    self.recommendations.append(f"Worth checking for SNAT issues: Review nftables/iptables masquerade rules on {degraded_cluster} (status: {degraded_status}; OVN-K local gateway mode can cause SNAT issues)")
+                else:
+                    self.recommendations.append(f"Check for routing issues: Review routing configuration on {degraded_cluster} (status: {degraded_status})")
+
+                self.recommendations.append(f"Check for firewall issues: Verify return traffic is allowed from {degraded_cluster} (status: {degraded_status})")
+
+                # Only recommend reviewing skip-src-ip-check results if they exist
+                if self.read_file("verify/connectivity-skip-src-ip-check.txt"):
+                    self.recommendations.append("Review connectivity verification results with --skip-src-ip-check flag")
+                elif is_ovnk:
+                    self.recommendations.append("Consider rerunning connectivity verification with --skip-src-ip-check to confirm whether source-IP rewriting is involved")
+
             if status1['status'] != 'connected':
                 self.issues.append(f"Cluster1 tunnel status: {status1['status']}")
             if status2['status'] != 'connected':
@@ -805,6 +873,7 @@ class SubmarinerAnalyzer:
 
         if not gateway1 and not gateway2:
             print(f"  {Colors.WARNING}⚠{Colors.ENDC} Could not read Gateway CRs")
+            print("     Possible cause: subctl gather failed (check collection.log for details)")
             return
 
         # Analyze cluster1
@@ -814,6 +883,53 @@ class SubmarinerAnalyzer:
         # Analyze cluster2
         if gateway2:
             self.analyze_gateway_blocking(gateway2, "cluster2")
+
+    def check_collection_errors(self):
+        """Check collection.log for critical errors that prevented data collection"""
+        collection_log_path = os.path.join(self.diagnostics_dir, "collection.log")
+        if not os.path.exists(collection_log_path):
+            return  # No collection.log (old diagnostic format)
+
+        collection_log = self.read_file("collection.log")
+        if not collection_log:
+            return
+
+        errors_found = []
+
+        # Check for subctl gather failures
+        if "Error creating directory" in collection_log and "Nom de répertoire non valide" in collection_log:
+            errors_found.append("subctl gather failed: Invalid directory name (Windows path issue with colons)")
+            errors_found.append("  → Context names with colons (:) cause errors on Windows")
+            errors_found.append("  → Re-collect from Linux, or use context names without special characters")
+        elif "Error creating directory" in collection_log:
+            errors_found.append("subctl gather failed: Error creating directory")
+
+        # Check for tcpdump collection failures
+        if "Failed to deploy tcpdump DaemonSet" in collection_log:
+            errors_found.append("tcpdump collection failed: Could not deploy DaemonSet")
+        if "tcpdump pod not found" in collection_log:
+            errors_found.append("tcpdump collection failed: Pod not found on gateway node")
+        if "Failed to extract files" in collection_log:
+            errors_found.append("tcpdump collection failed: Could not extract pcap/analysis files")
+
+        # Check for pod readiness timeouts
+        if "Pod did not become ready within 30s" in collection_log:
+            errors_found.append("tcpdump pod readiness timeout (may indicate image pull or scheduling issues)")
+
+        if errors_found:
+            # Store errors in state
+            self.collection_errors = errors_found
+            self.collection_failed = True
+
+            print(f"\n{Colors.FAIL}{'='*60}{Colors.ENDC}")
+            print(f"{Colors.FAIL}⚠ DATA COLLECTION ERRORS DETECTED{Colors.ENDC}")
+            print(f"{Colors.FAIL}{'='*60}{Colors.ENDC}")
+            print(f"\n{Colors.WARNING}The following errors occurred during data collection:{Colors.ENDC}\n")
+            for error in errors_found:
+                print(f"  • {error}")
+            print(f"\n{Colors.WARNING}Analysis results may be incomplete or inaccurate.{Colors.ENDC}")
+            print(f"{Colors.WARNING}Check collection.log for full details.{Colors.ENDC}")
+            print(f"{Colors.FAIL}{'='*60}{Colors.ENDC}\n")
 
     def find_and_read_gateway_cr(self, cluster):
         """Find and read the Gateway CR YAML"""
@@ -844,6 +960,58 @@ class SubmarinerAnalyzer:
 
         return None
 
+    def find_and_read_routeagent_crs(self, cluster):
+        """
+        Find and read RouteAgent CRs from both possible locations:
+        1. cluster/routeagents.yaml (cluster root - preferred)
+        2. cluster/gather/<name>/routeagents_*.yaml (gather subdirectories - fallback)
+
+        Returns a list of RouteAgent CR dictionaries
+        """
+        # Try cluster root first (preferred location)
+        routeagents_file = os.path.join(self.diagnostics_dir, cluster, "routeagents.yaml")
+        if os.path.exists(routeagents_file):
+            routeagents_yaml = self.read_yaml(os.path.join(cluster, "routeagents.yaml"))
+            if routeagents_yaml:
+                # Check if it's a List with items or a single resource
+                if routeagents_yaml.get('kind') == 'List':
+                    return routeagents_yaml.get('items', [])
+                else:
+                    return [routeagents_yaml]
+
+        # Fallback: try gather subdirectories
+        gather_dir = os.path.join(self.diagnostics_dir, cluster, "gather")
+        if not os.path.exists(gather_dir):
+            return []
+
+        # Navigate through nested subdirectories
+        current_dir = gather_dir
+        depth = 0
+
+        while depth < 4:
+            all_files = os.listdir(current_dir)
+
+            # Look for routeagent YAML files in current directory
+            for file in all_files:
+                if file.startswith("routeagents_") and file.endswith(".yaml"):
+                    relative_path = os.path.relpath(os.path.join(current_dir, file), self.diagnostics_dir)
+                    ra_yaml = self.read_yaml(relative_path)
+                    if ra_yaml:
+                        if ra_yaml.get('kind') == 'List':
+                            return ra_yaml.get('items', [])
+                        else:
+                            return [ra_yaml]
+
+            # If not found, go deeper
+            subdirs = [d for d in all_files if os.path.isdir(os.path.join(current_dir, d))]
+            if not subdirs:
+                break
+
+            current_dir = os.path.join(current_dir, subdirs[0])
+            depth += 1
+
+        return []
+
     def analyze_gateway_blocking(self, gateway_cr, cluster_name):
         """Analyze Gateway CR for blocking patterns"""
         if not gateway_cr or 'status' not in gateway_cr:
@@ -851,6 +1019,26 @@ class SubmarinerAnalyzer:
 
         status = gateway_cr.get('status', {})
         gateways = status.get('gateways', [])
+
+        # Check if we have asymmetric tunnel status
+        is_asymmetric = False
+        other_cluster_connected = False
+        current_cluster_connected = False
+        if self.tunnel_status:
+            status1 = self.tunnel_status.get('cluster1', {}).get('status')
+            status2 = self.tunnel_status.get('cluster2', {}).get('status')
+
+            # Asymmetric if one is connected and the other is not
+            is_asymmetric = (status1 == 'connected' and status2 != 'connected') or \
+                           (status2 == 'connected' and status1 != 'connected')
+
+            # Check if the OTHER cluster and CURRENT cluster are connected
+            if cluster_name == 'cluster1':
+                current_cluster_connected = (status1 == 'connected')
+                other_cluster_connected = (status2 == 'connected')
+            else:
+                current_cluster_connected = (status2 == 'connected')
+                other_cluster_connected = (status1 == 'connected')
 
         for gw in gateways:
             connections = gw.get('connections', [])
@@ -864,27 +1052,61 @@ class SubmarinerAnalyzer:
                 status_msg = conn.get('statusMessage', '')
 
                 if conn_status != 'connected' and backend == 'libreswan':
-                    # ESP blocking pattern
-                    if using_ip == private_ip:
-                        self.issues.append(f"{cluster_name}: Appears to be infrastructure/firewall issue preventing IPsec tunnel")
-                        self.recommendations.append(
-                            f"{cluster_name}: Verify infrastructure configuration, consider UDP encapsulation as alternative"
-                        )
-                        print(f"  {Colors.FAIL}✗{Colors.ENDC} {cluster_name}: It seems like infrastructure/firewall is preventing Submariner IPsec tunnel")
-                        print(f"    Using IP: {using_ip} (private IP - suggests ESP protocol (IP protocol 50))")
-                        print(f"    → Verify all required Submariner ports/protocols are allowed in your infrastructure")
-                        print(f"    → Alternative: Enable UDP encapsulation if ESP is blocked")
+                    # If asymmetric (other cluster connected), be more cautious
+                    # This suggests SNAT/routing issue rather than simple firewall block
+                    if is_asymmetric and other_cluster_connected and not current_cluster_connected:
+                        # Detect CNI to provide more specific guidance
+                        cni = self.detect_cni(cluster_name)
+                        is_ovnk = (cni == "OVNKubernetes")
 
-                    # UDP blocking pattern
-                    elif using_ip == public_ip:
-                        self.issues.append(f"{cluster_name}: Appears to be UDP port blocking at infrastructure level")
-                        self.recommendations.append(
-                            f"{cluster_name}: Verify firewall allows UDP ports 500/4500, consider VxLAN as alternative"
-                        )
-                        print(f"  {Colors.FAIL}✗{Colors.ENDC} {cluster_name}: It seems like UDP ports may be blocked at infrastructure level")
-                        print(f"    Using IP: {using_ip} (public IP - UDP encapsulation)")
-                        print(f"    → Verify UDP ports 500 and 4500 are allowed in firewall/security groups")
-                        print(f"    → Alternative: Consider VxLAN cable driver if UDP is blocked")
+                        # Don't conclude infrastructure/firewall - already flagged as asymmetric
+                        # Just note the technical details
+                        if using_ip == private_ip:
+                            print(f"  {Colors.WARNING}⚠{Colors.ENDC} {cluster_name}: Tunnel not connected (using private IP - ESP protocol)")
+                            print(f"    Using IP: {using_ip} (ESP - IP protocol 50)")
+                            print(f"    CNI: {cni}")
+                            if is_ovnk:
+                                print("    → Asymmetric status could suggest SNAT issue (OVN-K local gateway mode worth checking)")
+                                print("    → Review nftables masquerade rules and routing configuration")
+                            else:
+                                print("    → Asymmetric status suggests routing issue (see recommendations above)")
+                                print("    → Review routing configuration and return path")
+                        elif using_ip == public_ip:
+                            print(f"  {Colors.WARNING}⚠{Colors.ENDC} {cluster_name}: Tunnel not connected (using public IP - NAT-T)")
+                            print(f"    Using IP: {using_ip} (NAT-T - UDP encapsulation)")
+                            print(f"    CNI: {cni}")
+                            if is_ovnk:
+                                print("    → Asymmetric status could suggest SNAT issue (OVN-K local gateway mode worth checking)")
+                                print("    → Review return path routing and NAT configuration")
+                            else:
+                                print("    → Asymmetric status suggests routing issue (see recommendations above)")
+                                print("    → Review return path routing and NAT configuration")
+                    elif is_asymmetric and current_cluster_connected:
+                        # The aggregate tunnel status for this cluster is connected; avoid
+                        # classifying stale/passive connection entries as infrastructure failures.
+                        continue
+                    else:
+                        # Both tunnels down OR no asymmetry detected - likely infrastructure issue
+                        if using_ip == private_ip:
+                            self.issues.append(f"{cluster_name}: Possible infrastructure/firewall issue preventing IPsec tunnel")
+                            self.recommendations.append(
+                                f"{cluster_name}: Verify infrastructure configuration, consider UDP encapsulation as alternative"
+                            )
+                            print(f"  {Colors.FAIL}✗{Colors.ENDC} {cluster_name}: Possible infrastructure/firewall blocking IPsec tunnel")
+                            print(f"    Using IP: {using_ip} (private IP - suggests ESP protocol (IP protocol 50))")
+                            print("    → Verify all required Submariner ports/protocols are allowed in your infrastructure")
+                            print("    → Alternative: Enable UDP encapsulation if ESP is blocked")
+
+                        # UDP blocking pattern
+                        elif using_ip == public_ip:
+                            self.issues.append(f"{cluster_name}: Possible UDP port blocking at infrastructure level")
+                            self.recommendations.append(
+                                f"{cluster_name}: Verify firewall allows UDP ports 500/4500, consider VxLAN as alternative"
+                            )
+                            print(f"  {Colors.FAIL}✗{Colors.ENDC} {cluster_name}: Possible UDP port blocking at infrastructure level")
+                            print(f"    Using IP: {using_ip} (public IP - UDP encapsulation)")
+                            print("    → Verify UDP ports 500 and 4500 are allowed in firewall/security groups")
+                            print("    → Alternative: Consider VxLAN cable driver if UDP is blocked")
 
     def check_loadbalancer_service(self, cluster_name):
         """Check LoadBalancer service configuration for hosted clusters"""
@@ -897,8 +1119,8 @@ class SubmarinerAnalyzer:
         hosted_cluster = spec.get('hostedCluster', False)
         lb_enabled = spec.get('loadBalancerEnabled', False)
 
-        if not hosted_cluster or not lb_enabled:
-            return None  # Not a hosted cluster with load balancer
+        if not lb_enabled:
+            return None  # LoadBalancer service not enabled
 
         # Find and read the submariner-gateway service manifest
         gather_dir = os.path.join(self.diagnostics_dir, cluster_name, "gather")
@@ -991,6 +1213,15 @@ class SubmarinerAnalyzer:
 
         print(f"\n{Colors.BOLD}=== Analyzing Packet Captures ==={Colors.ENDC}")
 
+        # Check if LoadBalancer is enabled (affects tcpdump interpretation)
+        lb_enabled_cluster1 = self.check_loadbalancer_enabled('cluster1')
+        lb_enabled_cluster2 = self.check_loadbalancer_enabled('cluster2')
+        using_loadbalancer = lb_enabled_cluster1 or lb_enabled_cluster2
+
+        if using_loadbalancer:
+            print(f"  {Colors.BOLD}Note:{Colors.ENDC} LoadBalancer service detected - tcpdump interpretation adjusted")
+            print("        Incoming traffic arrives on NodePort, not service port 4500")
+
         # Find analysis files with glob pattern
         import glob
         cluster1_files = glob.glob(os.path.join(tcpdump_dir, "cluster1-gateway-*-analysis.txt"))
@@ -1010,6 +1241,10 @@ class SubmarinerAnalyzer:
 
         # Detect protocol from capture filter
         protocol_info = self.detect_protocol_from_tcpdump(cluster1_analysis or cluster2_analysis)
+
+        # Check if capture includes ICMP (new collection format)
+        capture_filter = self.extract_capture_filter(cluster1_analysis or cluster2_analysis)
+        has_icmp_capture = capture_filter and 'icmp' in capture_filter.lower()
 
         # Extract packet counts and directions
         packets1_total = self.extract_packet_count(cluster1_analysis) if cluster1_analysis else 0
@@ -1039,28 +1274,134 @@ class SubmarinerAnalyzer:
         if packets1_total > 0 and packets2_total > 0:
             # Both clusters sending packets
             if packets1_out and not packets1_in and packets2_out and not packets2_in:
-                # Both sending, neither receiving (bidirectional blocking)
-                self.issues.append(f"CRITICAL: Both clusters sending tunnel packets but neither receiving → Appears to be infrastructure blocking {protocol_info['description']} in both directions")
+                # Both sending, neither receiving - check if this is LoadBalancer-related
+                if using_loadbalancer and protocol_info['type'] == 'udp':
+                    # Extract NodePort packet counts
+                    nodeport_packets1 = self.extract_nodeport_packet_count(cluster1_analysis)
+                    nodeport_packets2 = self.extract_nodeport_packet_count(cluster2_analysis)
 
-                # Build recommendations based on protocol type
-                if protocol_info['type'] == 'esp':
-                    self.recommendations.append(f"Verify Submariner prerequisites - ensure {protocol_info['description']} is allowed between gateway nodes")
-                    self.recommendations.append("Enable UDP encapsulation (ceIPSecForceUDPEncaps: true) as workaround if ESP is blocked but UDP port 4500 is allowed")
-                elif protocol_info['type'] == 'udp':
-                    self.recommendations.append(f"Verify Submariner prerequisites - ensure {protocol_info['description']} is allowed between gateway nodes")
+                    # Check if this is new enhanced capture (has NodePort stats)
+                    has_nodeport_stats = (nodeport_packets1 > 0 or nodeport_packets2 > 0 or
+                                        'NodePort packets' in (cluster1_analysis or '') or
+                                        'NodePort packets' in (cluster2_analysis or ''))
+
+                    if has_nodeport_stats:
+                        # New enhanced tcpdump with NodePort capture
+                        print(f"\n  {Colors.BOLD}LoadBalancer Traffic Analysis:{Colors.ENDC}")
+
+                        ovn_issue_found = False
+                        lb_issue_found = False
+
+                        # Analyze Cluster 1
+                        if nodeport_packets1 > 0 and packets1_total == 0:
+                            print(f"  {Colors.FAIL}✗ Cluster1:{Colors.ENDC}")
+                            print(f"    NodePort traffic: {nodeport_packets1} packets arriving")
+                            print(f"    Gateway pod traffic: 0 packets")
+                            print(f"    → {Colors.FAIL}OVN NOT forwarding NodePort -> gateway pod{Colors.ENDC}")
+                            self.faulty_states.append("Cluster1: OVN forwarding failure (NodePort -> pod)")
+                            ovn_issue_found = True
+                        elif nodeport_packets1 == 0 and packets1_total == 0:
+                            print(f"  {Colors.FAIL}✗ Cluster1:{Colors.ENDC}")
+                            print(f"    NodePort traffic: 0 packets")
+                            print(f"    Gateway pod traffic: 0 packets")
+                            print(f"    → {Colors.FAIL}LoadBalancer not forwarding or firewall blocking{Colors.ENDC}")
+                            self.faulty_states.append("Cluster1: LoadBalancer/firewall issue")
+                            lb_issue_found = True
+                        else:
+                            print(f"  {Colors.OKGREEN}✓ Cluster1:{Colors.ENDC} Sending traffic")
+
+                        # Analyze Cluster 2
+                        if nodeport_packets2 > 0 and packets2_total == 0:
+                            print(f"  {Colors.FAIL}✗ Cluster2:{Colors.ENDC}")
+                            print(f"    NodePort traffic: {nodeport_packets2} packets arriving")
+                            print(f"    Gateway pod traffic: 0 packets")
+                            print(f"    → {Colors.FAIL}OVN NOT forwarding NodePort -> gateway pod{Colors.ENDC}")
+                            self.faulty_states.append("Cluster2: OVN forwarding failure (NodePort -> pod)")
+                            ovn_issue_found = True
+                        elif nodeport_packets2 == 0 and packets2_total == 0:
+                            print(f"  {Colors.FAIL}✗ Cluster2:{Colors.ENDC}")
+                            print(f"    NodePort traffic: 0 packets")
+                            print(f"    Gateway pod traffic: 0 packets")
+                            print(f"    → {Colors.FAIL}LoadBalancer not forwarding or firewall blocking{Colors.ENDC}")
+                            self.faulty_states.append("Cluster2: LoadBalancer/firewall issue")
+                            lb_issue_found = True
+                        else:
+                            print(f"  {Colors.OKGREEN}✓ Cluster2:{Colors.ENDC} Sending traffic")
+
+                        # Add specific recommendations
+                        if ovn_issue_found:
+                            print(f"\n  {Colors.BOLD}OVN Forwarding Issue Detected:{Colors.ENDC}")
+                            print("    Traffic arrives at NodePorts but doesn't reach gateway pod")
+                            self.recommendations.append("OVN forwarding issue - traffic arrives on NodePort but not forwarded to pod:")
+                            self.recommendations.append("  1. Restart ovnkube-node: oc delete pod -n openshift-ovn-kubernetes -l app=ovnkube-node --field-selector spec.nodeName=<gateway-node>")
+                            self.recommendations.append("  2. Check OVN load balancer: oc debug node/<gateway-node> -- chroot /host ovn-nbctl list load_balancer | grep submariner")
+                            self.recommendations.append("  3. Check OVS flows: oc debug node/<gateway-node> -- chroot /host ovs-ofctl dump-flows br-int | grep -E '4500|4490'")
+                            self.recommendations.append("  4. Clear conntrack: oc debug node/<gateway-node> -- chroot /host conntrack -F")
+                            self.recommendations.append("  5. If issue persists, restart VMs/nodes as last resort")
+
+                        if lb_issue_found:
+                            print(f"\n  {Colors.BOLD}LoadBalancer/Firewall Issue Detected:{Colors.ENDC}")
+                            print("    No traffic arriving at NodePorts from LoadBalancer")
+                            self.recommendations.append("LoadBalancer/firewall issue - no traffic reaching NodePorts:")
+                            self.recommendations.append("  1. Verify LoadBalancer backend pool includes cluster nodes")
+                            self.recommendations.append("  2. Check cloud provider security groups allow UDP to NodePorts")
+                            self.recommendations.append("  3. Verify firewall rules between LoadBalancers")
+                            self.recommendations.append("  4. Check LoadBalancer health checks are passing")
+
+                    else:
+                        # Old tcpdump format without NodePort capture
+                        print(f"\n  {Colors.WARNING}⚠ PATTERN DETECTED:{Colors.ENDC}")
+                        print("    Outgoing UDP packets detected, no incoming on port 4500")
+                        print("    → LoadBalancer service is enabled - incoming traffic arrives on NodePort")
+                        print("    → Cannot reliably determine infrastructure blocking from tcpdump alone")
+                        print(f"\n  {Colors.WARNING}Note:{Colors.ENDC} Old tcpdump format - recommend re-collecting with enhanced version")
+
+                        if has_icmp_capture:
+                            print(f"\n  {Colors.BOLD}Analysis:{Colors.ENDC}")
+                            print("    Capture filter includes ICMP - check if health check pings arrive")
+                        else:
+                            print(f"\n  {Colors.BOLD}Analysis:{Colors.ENDC}")
+                            print("    Old capture filter (no ICMP) - cannot determine if traffic arrives")
+
+                        # Check firewall test results as fallback
+                        firewall_results = self.check_firewall_test_results()
+                        if firewall_results:
+                            print(f"\n  {Colors.BOLD}Firewall Test Results:{Colors.ENDC}")
+                            if firewall_results.get('passed'):
+                                print(f"    {Colors.OKGREEN}✓{Colors.ENDC} Firewall inter-cluster test PASSED")
+                                print("    → Infrastructure is NOT blocking UDP traffic")
+                                self.findings.append("Infrastructure allows UDP traffic (firewall test passed)")
+                            else:
+                                print(f"    {Colors.FAIL}✗{Colors.ENDC} Firewall inter-cluster test FAILED")
+                                print("    → Appears to be infrastructure blocking UDP traffic")
+                                self.issues.append(f"Infrastructure appears to be blocking {protocol_info['description']}")
+                        else:
+                            print(f"\n  {Colors.WARNING}Note:{Colors.ENDC} No firewall test results available")
+
+                        self.recommendations.append("Re-collect diagnostics to get enhanced NodePort analysis")
                 else:
-                    self.recommendations.append("Verify Submariner prerequisites - ensure required protocols are allowed between gateway nodes")
+                    # Not using LoadBalancer or using ESP - original logic applies
+                    self.issues.append(f"CRITICAL: Both clusters sending tunnel packets but neither receiving → Appears to be infrastructure blocking {protocol_info['description']} in both directions")
 
-                print(f"\n  {Colors.FAIL}✗ CRITICAL FINDING:{Colors.ENDC}")
-                print(f"    Both clusters sending packets but NEITHER receiving")
-                print(f"    → It seems that infrastructure is blocking {protocol_info['description']} in BOTH directions")
-                print(f"    → Packets appear to leave source but not arrive at destination")
-                print(f"\n  {Colors.BOLD}Recommended Investigation:{Colors.ENDC}")
-                print(f"    1. Verify infrastructure allows {protocol_info['description']} between gateway nodes")
-                print(f"    2. Check firewall/security groups/network policies")
-                if protocol_info['type'] == 'esp':
-                    print(f"    3. Try UDP encapsulation as workaround if ESP is blocked")
-                print(f"    📖 Submariner Prerequisites: https://submariner.io/operations/deployment/prerequisites/")
+                    # Build recommendations based on protocol type
+                    if protocol_info['type'] == 'esp':
+                        self.recommendations.append(f"Verify Submariner prerequisites - ensure {protocol_info['description']} is allowed between gateway nodes")
+                        self.recommendations.append("Enable UDP encapsulation (ceIPSecForceUDPEncaps: true) as workaround if ESP is blocked but UDP port 4500 is allowed")
+                    elif protocol_info['type'] == 'udp':
+                        self.recommendations.append(f"Verify Submariner prerequisites - ensure {protocol_info['description']} is allowed between gateway nodes")
+                    else:
+                        self.recommendations.append("Verify Submariner prerequisites - ensure required protocols are allowed between gateway nodes")
+
+                    print(f"\n  {Colors.FAIL}✗ CRITICAL FINDING:{Colors.ENDC}")
+                    print("    Both clusters sending packets but NEITHER receiving")
+                    print(f"    → It seems that infrastructure is blocking {protocol_info['description']} in BOTH directions")
+                    print("    → Packets appear to leave source but not arrive at destination")
+                    print(f"\n  {Colors.BOLD}Recommended Investigation:{Colors.ENDC}")
+                    print(f"    1. Verify infrastructure allows {protocol_info['description']} between gateway nodes")
+                    print("    2. Check firewall/security groups/network policies")
+                    if protocol_info['type'] == 'esp':
+                        print("    3. Try UDP encapsulation as workaround if ESP is blocked")
+                    print("    📖 Submariner Prerequisites: https://submariner.io/operations/deployment/prerequisites/")
             elif packets1_in and packets1_out and packets2_in and packets2_out:
                 # Bidirectional traffic working
                 print(f"  {Colors.OKGREEN}✓{Colors.ENDC} Bidirectional packet flow detected")
@@ -1084,13 +1425,52 @@ class SubmarinerAnalyzer:
             print(f"  {Colors.FAIL}✗{Colors.ENDC} No packets captured on either cluster")
             print(f"    → Gateways not sending tunnel traffic - check gateway logs")
 
+    def check_loadbalancer_enabled(self, cluster_name):
+        """Check if LoadBalancer service is enabled from Submariner CR"""
+        # Use existing find_and_read_gateway_cr which handles both single-level
+        # and nested directory layouts
+        submariner_cr = self.find_and_read_gateway_cr(cluster_name)
+        if submariner_cr:
+            spec = submariner_cr.get('spec', {})
+            return spec.get('loadBalancerEnabled', False)
+        return False
+
+    def check_firewall_test_results(self):
+        """Check if firewall inter-cluster test results are available and passed"""
+        firewall_file = os.path.join(self.diagnostics_dir, "firewall", "firewall-inter-cluster.txt")
+        if not os.path.exists(firewall_file):
+            return None
+
+        content = self.read_file("firewall/firewall-inter-cluster.txt")
+        if not content:
+            return None
+
+        # Look for test result
+        if "Tunnels can be established" in content and "✓" in content:
+            return {'passed': True}
+        elif "error" in content.lower() or "fail" in content.lower() or "cannot" in content.lower() or "timed out" in content.lower():
+            return {'passed': False}
+
+        return None
+
+    def extract_capture_filter(self, analysis_content):
+        """Extract capture filter from tcpdump analysis"""
+        if not analysis_content:
+            return None
+        filter_match = re.search(r'Capture Filter.*?:\s*(.+)', analysis_content)
+        return filter_match.group(1).strip() if filter_match else None
+
     def detect_protocol_from_tcpdump(self, analysis_content):
         """Detect protocol from tcpdump capture filter"""
         if not analysis_content:
             return {'type': 'unknown', 'description': 'tunnel traffic'}
 
-        # Look for capture filter line
-        filter_match = re.search(r'Capture Filter:\s*(.+)', analysis_content)
+        # Look for tunnel-specific capture filter line (new format)
+        filter_match = re.search(r'Capture Filter \(tunnel\):\s*(.+)', analysis_content)
+        if not filter_match:
+            # Fallback to old format for backwards compatibility
+            filter_match = re.search(r'Capture Filter:\s*(.+)', analysis_content)
+
         if not filter_match:
             return {'type': 'unknown', 'description': 'tunnel traffic'}
 
@@ -1109,17 +1489,48 @@ class SubmarinerAnalyzer:
         """Check if packets in a specific direction (In/Out) exist"""
         if not analysis_content:
             return False
+        # Only inspect the tunnel packet section; ICMP summaries are diagnostic
+        # noise for tunnel-direction inference.
+        tunnel_section = analysis_content
+        start_marker = "FIRST 50 TUNNEL PACKETS (detailed):"
+        end_marker = "UNIQUE SOURCE -> DESTINATION PAIRS"
+        if start_marker in analysis_content:
+            tunnel_section = analysis_content.split(start_marker, 1)[1]
+            if end_marker in tunnel_section:
+                tunnel_section = tunnel_section.split(end_marker, 1)[0]
+
         # Look for direction indicator in packet details
-        return f" {direction} " in analysis_content or f"wlp0s20f3 {direction}" in analysis_content
+        return f" {direction} " in tunnel_section or f"wlp0s20f3 {direction}" in tunnel_section
 
     def extract_packet_count(self, analysis_content):
-        """Extract total packet count from tcpdump analysis"""
+        """Extract tunnel packet count from tcpdump analysis (excluding ICMP)"""
         if not analysis_content:
             return 0
+        # Try to get tunnel-specific packet count first (new format)
+        match = re.search(r'Tunnel packets.*?:\s+(\d+)', analysis_content)
+        if match:
+            return int(match.group(1))
+        # Fallback to total packets for backwards compatibility
         match = re.search(r'Total packets captured:\s+(\d+)', analysis_content)
         if match:
             return int(match.group(1))
         return 0
+
+    def extract_nodeport_packet_count(self, analysis_content):
+        """Extract NodePort packet count from tcpdump analysis (LoadBalancer deployments)"""
+        if not analysis_content:
+            return 0
+        match = re.search(r'NodePort packets.*?:\s+(\d+)', analysis_content)
+        if match:
+            return int(match.group(1))
+        return 0
+
+    def check_ovn_forwarding_issue(self, analysis_content):
+        """Check if analysis indicates OVN forwarding issue (NodePort traffic but no tunnel traffic)"""
+        if not analysis_content:
+            return False
+        # Look for the specific warning message we generate
+        return 'OVN is NOT forwarding NodePort -> gateway pod ports' in analysis_content
 
     def analyze_pod_health(self):
         """Check pod status"""
@@ -1317,7 +1728,7 @@ class SubmarinerAnalyzer:
             spec = gateway_cr.get('spec', {})
             hosted_cluster = spec.get('hostedCluster', False)
             lb_enabled = spec.get('loadBalancerEnabled', False)
-            using_loadbalancer = hosted_cluster and lb_enabled
+            using_loadbalancer = lb_enabled
 
             # Get expected HA state from Gateway CR
             gateways = gateway_cr.get('status', {}).get('gateways', [])
@@ -1458,22 +1869,13 @@ class SubmarinerAnalyzer:
             # Get gateway status first (gateway-to-gateway connectivity)
             gateway_status = self.get_gateway_status(cluster, actual_cluster_name)
 
-            # Read RouteAgent CRs from gather subdirectory
-            gather_dir = os.path.join(self.diagnostics_dir, cluster, "gather", actual_cluster_name)
-            if not os.path.exists(gather_dir):
-                print(f"  {cluster}: {Colors.WARNING}No gather data for {actual_cluster_name}{Colors.ENDC}")
-                continue
-
-            # Collect all RouteAgent YAML files
-            agents = []
-            for file in os.listdir(gather_dir):
-                if file.startswith("routeagents_submariner-operator_") and file.endswith(".yaml"):
-                    agent_yaml = self.read_yaml(os.path.join(cluster, "gather", actual_cluster_name, file))
-                    if agent_yaml:
-                        agents.append(agent_yaml)
+            # Read RouteAgent CRs using unified method that handles both layouts
+            agents = self.find_and_read_routeagent_crs(cluster)
 
             if not agents:
-                print(f"  {Colors.WARNING}⚠{Colors.ENDC} {cluster}: No RouteAgent resources")
+                # RouteAgent resources were added in recent Submariner versions (last 2-3 releases)
+                # If not found, this could be an older version
+                print(f"  {Colors.WARNING}⚠{Colors.ENDC} {cluster}: No RouteAgent resources (older Submariner version or not collected)")
                 continue
 
             # Analyze each RouteAgent
@@ -1520,6 +1922,31 @@ class SubmarinerAnalyzer:
             print(f"  {cluster}: {len(agents)} RouteAgents found")
             print(f"    Connected: {len(connected_agents)}")
             print(f"    Gateway nodes: {len(gateway_agents)} (health check not performed)")
+
+            # CRITICAL CHECK: Pattern 2 - Gateway error + RouteAgent connected
+            # This indicates tunnel datapath is actually working!
+            if gateway_status and connected_agents:
+                gw_status = gateway_status.get('status', 'unknown')
+                if gw_status == 'error' and len(connected_agents) > 0:
+                    print(f"\n  {Colors.BOLD}🔍 CRITICAL PATTERN DETECTED:{Colors.ENDC}")
+                    print(f"    {Colors.FAIL}✗{Colors.ENDC} Gateway health check: {Colors.FAIL}ERROR{Colors.ENDC}")
+                    print(f"    {Colors.OKGREEN}✓{Colors.ENDC} RouteAgent health check: {Colors.OKGREEN}CONNECTED{Colors.ENDC} ({len(connected_agents)} nodes)")
+                    print(f"\n  {Colors.BOLD}Analysis:{Colors.ENDC}")
+                    print(f"    → Tunnel datapath is {Colors.OKGREEN}ACTUALLY WORKING{Colors.ENDC}!")
+                    print("    → Gateway health check failure is misleading")
+                    print("    → RouteAgent tests full path: WorkerNode → LocalGW → RemoteGW")
+                    print("    → Most likely cause: Gateway health check IP configuration issue")
+                    print(f"\n  {Colors.BOLD}Recommendation:{Colors.ENDC}")
+                    print("    - Verify health check IPs are correctly configured")
+                    print("    - Check if health check IP exists on gateway node (ip-a.log)")
+                    print("    - Investigate why gateway pod health check fails despite datapath working")
+                    print(f"    - {Colors.OKGREEN}Do NOT waste time on infrastructure blocking investigation{Colors.ENDC}")
+
+                    self.findings.append(f"{cluster}: Tunnel datapath is working (RouteAgent proves it)")
+                    self.recommendations.append(
+                        f"{cluster}: Gateway health check failure is misleading - verify health check IP configuration"
+                    )
+                    # Don't add this to issues since it's actually working!
 
             if error_agents:
                 print(f"    {Colors.FAIL}Errors: {len(error_agents)}{Colors.ENDC}")
@@ -1796,12 +2223,14 @@ class SubmarinerAnalyzer:
 
         errors = []
 
-        # Skip health check ping failures as they're symptoms not root causes
+        # Skip health check ping failures and cleanup errors as they're symptoms not root causes
         skip_patterns = [
             'Failed to successfully ping',
             'healthChecker timed out',
             'health check.*timeout',
-            'ping.*timeout'
+            'ping.*timeout',
+            'error clearing chain',  # Transient cleanup errors (e.g., "Device or resource busy")
+            'error deleting chain',  # Transient cleanup errors during endpoint removal
         ]
 
         # Significant error patterns to look for
@@ -1853,14 +2282,114 @@ class SubmarinerAnalyzer:
             # Provide specific guidance for libreswan errors
             if libreswan_errors:
                 self.issues.append(f"{cluster_name}/{component}: Libreswan version compatibility issue detected")
-                self.recommendations.insert(0, f"{Colors.FAIL}CRITICAL:{Colors.ENDC} {cluster_name} - Libreswan version incompatibility - this is a Submariner software bug")
-                self.recommendations.insert(1, "Contact Submariner experts - Slack: https://kubernetes.slack.com/archives/C010RJV694M")
-                self.recommendations.insert(2, "Open GitHub issue: https://github.com/submariner-io/submariner/issues")
-                self.recommendations.insert(3, "Provide diagnostic tarball and mention libreswan version incompatibility with --encapsulation flag")
+
+                # Search GitHub for known issues/fixes
+                print(f"\n  {Colors.BOLD}Searching GitHub for known issues...{Colors.ENDC}")
+                github_results = self.search_github_for_bug("libreswan encapsulation",
+                                                             "Libreswan encapsulation flag incompatibility")
+
+                if github_results and github_results['found_fix']:
+                    # Fix exists!
+                    print(f"  {Colors.OKGREEN}✓ Known issue - FIX AVAILABLE{Colors.ENDC}")
+
+                    # Show relevant PRs
+                    if github_results['prs']:
+                        pr = github_results['prs'][0]  # Most recent/relevant
+                        print(f"    Fix: {pr['title']}")
+                        print(f"    PR: {pr['url']}")
+                        print(f"    Merged: {pr['mergedAt'][:10]}")
+
+                    # Show relevant issues
+                    if github_results['issues']:
+                        issue = github_results['issues'][0]
+                        print(f"    Issue: {issue['title']}")
+                        print(f"    URL: {issue['url']}")
+                        print(f"    Status: {issue['state']}")
+
+                    self.recommendations.insert(0, f"{Colors.FAIL}KNOWN BUG - FIX AVAILABLE:{Colors.ENDC} Libreswan version incompatibility")
+                    self.recommendations.insert(1, f"Upgrade to latest Submariner build (fix merged: {github_results['prs'][0]['mergedAt'][:10]})" if github_results['prs'] else "Upgrade to latest Submariner build")
+                    self.recommendations.insert(2, f"GitHub: {github_results['prs'][0]['url']}" if github_results['prs'] else f"GitHub: {github_results['issues'][0]['url']}" if github_results['issues'] else "GitHub: https://github.com/submariner-io/submariner/issues")
+                    self.recommendations.insert(3, "Workaround: Switch to VxLAN cable driver if upgrade not immediately possible")
+                elif github_results and github_results['issues']:
+                    # Issue reported but no fix yet
+                    print(f"  {Colors.WARNING}⚠ Known issue - NO FIX YET{Colors.ENDC}")
+                    issue = github_results['issues'][0]
+                    print(f"    Issue: {issue['title']}")
+                    print(f"    URL: {issue['url']}")
+                    print(f"    Status: {issue['state']}")
+
+                    self.recommendations.insert(0, f"{Colors.FAIL}KNOWN BUG:{Colors.ENDC} {cluster_name} - Libreswan version incompatibility")
+                    self.recommendations.insert(1, f"Track issue: {issue['url']}")
+                    self.recommendations.insert(2, "Workaround: Switch to VxLAN cable driver")
+                    self.recommendations.insert(3, "Contact Submariner - Slack: https://kubernetes.slack.com/archives/C010RJV694M")
+                else:
+                    # No GitHub results (either gh CLI not available or new bug)
+                    if github_results is None:
+                        print(f"  {Colors.WARNING}(GitHub CLI not available - skipping online search){Colors.ENDC}")
+
+                    self.recommendations.insert(0, f"{Colors.FAIL}CRITICAL:{Colors.ENDC} {cluster_name} - Libreswan version incompatibility - this is a Submariner software bug")
+                    self.recommendations.insert(1, "Contact Submariner experts - Slack: https://kubernetes.slack.com/archives/C010RJV694M")
+                    self.recommendations.insert(2, "Open GitHub issue: https://github.com/submariner-io/submariner/issues")
+                    self.recommendations.insert(3, "Provide diagnostic tarball and mention libreswan version incompatibility with --encapsulation flag")
             else:
                 self.recommendations.append(
                     f"{cluster_name}/{component}: Review pod logs for detailed error messages"
                 )
+
+    def search_github_for_bug(self, search_terms, bug_description):
+        """Search GitHub issues and PRs for known bugs
+
+        Args:
+            search_terms: String to search for (e.g., "libreswan encapsulation")
+            bug_description: Human-readable description of the bug
+
+        Returns:
+            dict with 'issues' and 'prs' lists, or None if gh CLI not available
+        """
+        try:
+            # Check if gh CLI is available
+            result = subprocess.run(['gh', '--version'], capture_output=True, text=True, timeout=5)
+            if result.returncode != 0:
+                return None
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return None
+
+        results = {'issues': [], 'prs': [], 'found_fix': False}
+
+        try:
+            # Search for issues
+            issue_cmd = [
+                'gh', 'issue', 'list',
+                '--repo', 'submariner-io/submariner',
+                '--search', search_terms,
+                '--state', 'all',
+                '--limit', '5',
+                '--json', 'number,title,state,url'
+            ]
+            issue_result = subprocess.run(issue_cmd, capture_output=True, text=True, timeout=10)
+            if issue_result.returncode == 0:
+                results['issues'] = json.loads(issue_result.stdout)
+
+            # Search for PRs
+            pr_cmd = [
+                'gh', 'pr', 'list',
+                '--repo', 'submariner-io/submariner',
+                '--search', search_terms,
+                '--state', 'merged',
+                '--limit', '5',
+                '--json', 'number,title,mergedAt,url'
+            ]
+            pr_result = subprocess.run(pr_cmd, capture_output=True, text=True, timeout=10)
+            if pr_result.returncode == 0:
+                results['prs'] = json.loads(pr_result.stdout)
+                # Check if any PRs found (indicates fix exists)
+                if results['prs']:
+                    results['found_fix'] = True
+
+        except (subprocess.TimeoutExpired, json.JSONDecodeError):
+            return None
+
+        return results if (results['issues'] or results['prs']) else None
 
     def colorize_status(self, status):
         """Add color to status based on value"""
@@ -2067,7 +2596,15 @@ class SubmarinerAnalyzer:
             print(f"  {Colors.OKGREEN}✓{Colors.ENDC} Neither cluster has 'fwmark 0x3f0' rule (consistent)")
 
     def check_ovn_routing(self):
-        """Check OVN Logical_Router_Static_Route configuration"""
+        """
+        Check OVN routing configuration for Submariner.
+
+        Submariner uses two types of routing in OVN:
+        1. Gateway nodes: OVN router policies + static routes (via ovn-k8s-mp0 interface)
+        2. Non-gateway nodes: OVN router policies only (via transit switch IP)
+
+        Reference: https://github.com/submariner-io/enhancements/blob/devel/seps/SEP-0027-ovn-interconnect.md
+        """
         print(f"\n{Colors.BOLD}=== Checking OVN Routing Configuration ==={Colors.ENDC}")
 
         cluster_subdirs = self.get_cluster_subdirs()
@@ -2083,31 +2620,230 @@ class SubmarinerAnalyzer:
             if not os.path.exists(gather_dir):
                 continue
 
-            # Find gateway node (check one node for OVN routes)
-            gateway_node = None
-            for file in os.listdir(gather_dir):
-                if file.endswith("_ovn_lr_ovn_cluster_router_routes.log"):
-                    gateway_node = file.replace("_ovn_lr_ovn_cluster_router_routes.log", "")
-                    routes_content = self.read_file(os.path.join(cluster, "gather", actual_cluster_name, file))
+            # Get remote cluster CIDRs from GatewayRoute first, then fall back to Submariner CR
+            remote_cidrs = set()
 
-                    if routes_content:
-                        # Look for Submariner-added routes (check for remote cluster CIDRs)
-                        # Get remote cluster CIDRs from Gateway CR
-                        gateway_cr = self.find_and_read_gateway_cr(cluster)
-                        if gateway_cr and 'status' in gateway_cr:
-                            gateways = gateway_cr['status'].get('gateways', [])
-                            for gw in gateways:
-                                connections = gw.get('connections', [])
-                                for conn in connections:
-                                    endpoint = conn.get('endpoint', {})
-                                    subnets = endpoint.get('subnets', [])
-                                    for subnet in subnets:
-                                        if subnet in routes_content:
-                                            print(f"  {Colors.OKGREEN}✓{Colors.ENDC} {cluster}: OVN route found for {subnet}")
-                                        else:
-                                            print(f"  {Colors.FAIL}✗{Colors.ENDC} {cluster}: OVN route MISSING for {subnet}")
-                                            self.issues.append(f"{cluster}: OVN Logical_Router_Static_Route missing for {subnet}")
+            # Read Submariner CR from the same resolved gather directory
+            gateway_cr = None
+            for file in os.listdir(gather_dir):
+                if file.startswith("submariners_") and file.endswith(".yaml"):
+                    gateway_cr = self.read_yaml(os.path.join(cluster, "gather", actual_cluster_name, file))
                     break
+
+            # Aggregate remote CIDRs from every GatewayRoute CR in the bundle
+            for file in os.listdir(gather_dir):
+                if not file.startswith("gatewayroutes_"):
+                    continue
+                gateway_route_content = self.read_file(os.path.join(cluster, "gather", actual_cluster_name, file))
+                if not gateway_route_content:
+                    continue
+                try:
+                    gateway_route = yaml.safe_load(gateway_route_content)
+                    if gateway_route and 'spec' in gateway_route:
+                        remote_cidrs.update(gateway_route['spec'].get('remoteCIDRs', []))
+                except (yaml.YAMLError, ValueError) as exc:
+                    print(f"  {Colors.WARNING}⚠{Colors.ENDC} {cluster}: failed to parse {file}: {exc}")
+
+            # Fall back to Submariner CR if no GatewayRoute found
+            if not remote_cidrs:
+                if gateway_cr and 'status' in gateway_cr:
+                    for gw in gateway_cr['status'].get('gateways', []):
+                        for conn in gw.get('connections', []):
+                            remote_cidrs.update(conn.get('endpoint', {}).get('subnets', []))
+
+            if not remote_cidrs:
+                print(f"  {Colors.WARNING}⚠{Colors.ENDC} {cluster}: no remote CIDRs found for OVN route validation")
+                continue
+
+            # Get active gateway node hostname from Gateway CR
+            active_gateway_node = None
+            if gateway_cr and 'status' in gateway_cr:
+                gateways = gateway_cr['status'].get('gateways', [])
+                for gw in gateways:
+                    if gw.get('haStatus') == 'active':
+                        active_gateway_node = gw.get('localEndpoint', {}).get('hostname')
+                        break
+
+            # Check OVN router policies (should exist on ALL nodes)
+            policies_checked = False
+            for file in os.listdir(gather_dir):
+                if file.endswith("_ovn_lr_ovn_cluster_router_policies.log"):
+                    policies_content = self.read_file(os.path.join(cluster, "gather", actual_cluster_name, file))
+                    if policies_content:
+                        policies_checked = True
+                        node_name = file.replace("_ovn_lr_ovn_cluster_router_policies.log", "")
+                        # Check for Submariner router policies (priority 20000)
+                        for cidr in remote_cidrs:
+                            policy_match = f"ip4.dst == {cidr}"
+                            # Check that both the CIDR and exact priority 20000 appear on the same line
+                            found = False
+                            for line in policies_content.splitlines():
+                                if policy_match in line and re.search(r'\b20000\b', line):
+                                    found = True
+                                    break
+                            if found:
+                                print(f"  {Colors.OKGREEN}✓{Colors.ENDC} {cluster}/{node_name}: OVN router policy found for {cidr}")
+                            else:
+                                print(f"  {Colors.FAIL}✗{Colors.ENDC} {cluster}/{node_name}: OVN router policy MISSING for {cidr}")
+                                self.issues.append(f"{cluster}/{node_name}: OVN router policy missing for {cidr}")
+
+            if not policies_checked:
+                print(f"  {Colors.WARNING}⚠{Colors.ENDC} {cluster}: no OVN router policy logs found")
+
+            # Check OVN static routes (should ONLY exist on gateway nodes)
+            if active_gateway_node:
+                gateway_routes_file = f"{active_gateway_node}_ovn_lr_ovn_cluster_router_routes.log"
+                gateway_routes_path = os.path.join(cluster, "gather", actual_cluster_name, gateway_routes_file)
+                routes_content = self.read_file(gateway_routes_path)
+
+                if routes_content:
+                    for cidr in remote_cidrs:
+                        if cidr in routes_content:
+                            print(f"  {Colors.OKGREEN}✓{Colors.ENDC} {cluster}: OVN static route found for {cidr} on gateway node")
+                        else:
+                            print(f"  {Colors.FAIL}✗{Colors.ENDC} {cluster}: OVN static route MISSING for {cidr} on gateway node")
+                            self.issues.append(f"{cluster}: OVN static route missing for {cidr} on gateway node")
+                else:
+                    print(f"  {Colors.WARNING}⚠{Colors.ENDC} {cluster}: Could not read OVN routes from gateway node {active_gateway_node}")
+            else:
+                print(f"  {Colors.WARNING}⚠{Colors.ENDC} {cluster}: Could not determine active gateway node")
+
+    def check_ovn_local_gateway_mode_issue(self):
+        """
+        Check for known OVN-Kubernetes local gateway mode health check issue.
+
+        Detection criteria:
+        1. CNI is OVN-Kubernetes AND local gateway mode is detected
+        2. Gateway CR shows status: error with "Failed to successfully ping"
+        3. (Optional) RouteAgent CR shows status: connected despite Gateway error
+
+        Reference: https://github.com/submariner-io/submariner/issues/3857
+        """
+        print(f"\n{Colors.BOLD}=== Checking for OVN-K Local Gateway Mode Issue ==={Colors.ENDC}")
+
+        # Detect CNI for both clusters
+        cni_cluster1 = self.detect_cni("cluster1")
+        cni_cluster2 = self.detect_cni("cluster2")
+
+        if "OVN" not in cni_cluster1 and "OVN" not in cni_cluster2:
+            print(f"  {Colors.OKBLUE}ℹ{Colors.ENDC} CNI is not OVN-Kubernetes - skipping OVN local gateway mode check")
+            return
+
+        # Method 1: Check for breth0 interface on ALL nodes
+        cluster_subdirs = self.get_cluster_subdirs()
+        if not cluster_subdirs:
+            return
+
+        for cluster in ['cluster1', 'cluster2']:
+            actual_cluster_name = cluster_subdirs.get(cluster)
+            if not actual_cluster_name:
+                continue
+
+            gather_dir = os.path.join(self.diagnostics_dir, cluster, "gather", actual_cluster_name)
+            if not os.path.exists(gather_dir):
+                continue
+
+            print(f"\n  Checking {cluster}...")
+
+            # Count nodes with breth0
+            breth0_count = 0
+            total_nodes = 0
+            ip_a_files = []
+
+            for file in os.listdir(gather_dir):
+                if file.endswith("_ip-a.log"):
+                    total_nodes += 1
+                    ip_a_files.append(file)
+                    content = self.read_file(os.path.join(cluster, "gather", actual_cluster_name, file))
+                    if content and re.search(r'^\d+: breth0:', content, re.MULTILINE):
+                        breth0_count += 1
+
+            # Determine gateway mode (local mode = all nodes have breth0)
+            if total_nodes == 0:
+                print(f"    {Colors.WARNING}⚠{Colors.ENDC} Could not determine node count")
+                continue
+
+            is_local_mode = (breth0_count == total_nodes)
+
+            if is_local_mode:
+                print(f"    {Colors.WARNING}⚠{Colors.ENDC} OVN-K gateway mode: LOCAL")
+                print(f"      - All {total_nodes} nodes have breth0 interface")
+
+                # Check Gateway CR status directly
+                gateway_status = 'unknown'
+                gateway_message = ''
+                gateway_files = [f for f in os.listdir(gather_dir) if f.startswith("gateways_")]
+                for gw_file in gateway_files:
+                    gw_content = self.read_file(os.path.join(cluster, "gather", actual_cluster_name, gw_file))
+                    if gw_content:
+                        try:
+                            gw_yaml = yaml.safe_load(gw_content)
+                            if gw_yaml and 'status' in gw_yaml and 'connections' in gw_yaml['status']:
+                                connections = gw_yaml['status']['connections']
+                                if isinstance(connections, list) and len(connections) > 0 and isinstance(connections[0], dict):
+                                    gateway_status = connections[0].get('status', 'unknown')
+                                    gateway_message = connections[0].get('statusMessage', '')
+                                    break
+                        except yaml.YAMLError:
+                            continue
+
+                # Check RouteAgent status using unified method
+                routeagent_status = None
+                agents = self.find_and_read_routeagent_crs(cluster)
+                for ra_yaml in agents:
+                    if ra_yaml and 'status' in ra_yaml:
+                        remote_endpoints = ra_yaml['status'].get('remoteEndpoints', [])
+                        if isinstance(remote_endpoints, list) and remote_endpoints and isinstance(remote_endpoints[0], dict):
+                            routeagent_status = remote_endpoints[0].get('status', None)
+                            if routeagent_status:
+                                break
+
+                # Check for the issue pattern
+                has_ping_failure = gateway_status == 'error' and 'ping' in str(gateway_message).lower()
+                has_ra_connected = routeagent_status == 'connected'
+
+                if has_ping_failure:
+                    print(f"    {Colors.FAIL}✗{Colors.ENDC} Gateway status: {gateway_status}")
+                    print(f"      Message: {gateway_message}")
+
+                    if has_ra_connected:
+                        print(f"    {Colors.WARNING}⚠{Colors.ENDC} RouteAgent status: {routeagent_status} (discrepancy!)")
+
+                    # Check if globalnet is enabled
+                    has_globalnet = self.detect_globalnet(cluster)
+
+                    print(f"\n    {Colors.WARNING}⚠ POSSIBLE KNOWN ISSUE DETECTED:{Colors.ENDC}")
+                    print("      This configuration appears similar to a known issue with")
+                    print("      OVN-Kubernetes in local gateway mode.")
+                    print("")
+                    print(f"      {Colors.BOLD}References:{Colors.ENDC}")
+                    print("      • Issue: https://github.com/submariner-io/submariner/issues/3857")
+
+                    if not has_globalnet:
+                        print("      • Community workaround: https://github.com/yboaron/submariner-workarounds/")
+                        print("        tree/main/ovn-local-gateway-health-check")
+                        print("")
+                        print(f"      {Colors.BOLD}Important:{Colors.ENDC} This is a community workaround, not an official fix.")
+                        print("      Review and test thoroughly before applying.")
+                    else:
+                        print("")
+                        print(f"      {Colors.BOLD}Note:{Colors.ENDC} Globalnet is enabled - community workaround is NOT applicable.")
+                        print("      The workaround only works with non-globalnet deployments.")
+
+                    self.faulty_states.append(f"{cluster}: Possible OVN-K local gateway mode issue (health check failure)")
+                    self.issues.append(f"{cluster}: Configuration might be affected by OVN-K local gateway mode issue (#3857)")
+
+                    if not has_globalnet:
+                        self.recommendations.append(f"{cluster}: Review known issue submariner-io/submariner#3857 and evaluate community workaround")
+                    else:
+                        self.recommendations.append(f"{cluster}: Review known issue submariner-io/submariner#3857 (note: Globalnet enabled - community workaround not applicable)")
+                elif gateway_status == 'connected':
+                    print(f"    {Colors.OKGREEN}✓{Colors.ENDC} Gateway status: {gateway_status}")
+                else:
+                    print(f"    {Colors.WARNING}⚠{Colors.ENDC} Gateway status: {gateway_status} (but not 'ping' failure pattern)")
+            else:
+                print(f"    {Colors.OKBLUE}ℹ{Colors.ENDC} OVN-K gateway mode: SHARED (or not detected)")
+                print(f"      - {breth0_count}/{total_nodes} nodes have breth0 interface")
 
     def check_main_table_routes(self):
         """Check if main routing table has routes to remote cluster CIDRs"""
@@ -2158,6 +2894,57 @@ class SubmarinerAnalyzer:
                             print(f"  {Colors.OKGREEN}✓{Colors.ENDC} {cluster}: Main table does NOT have remote cluster routes (expected)")
                     break
 
+    def add_context_aware_recommendations(self):
+        """Add context-aware recommendations when no clear root cause is found"""
+
+        # Check if we have tunnel errors but no clear smoking gun
+        has_tunnel_errors = any('tunnel' in fault.lower() or 'error' in fault.lower()
+                               for fault in self.faulty_states)
+        has_routeagent_errors = any(data.get('errors', 0) > 0
+                                    for data in self.routeagent_data.values())
+
+        # Check if we already found specific actionable root causes
+        has_infrastructure_blocking = any('infrastructure' in rec.lower() and 'blocking' in rec.lower()
+                                          for rec in self.recommendations)
+        has_version_issue = any('version' in fault.lower() for fault in self.faulty_states)
+        has_ha_issue = any('multiple active' in issue.lower() for issue in self.issues)
+        has_mtu_issue = any('mtu' in issue.lower() for issue in self.issues)
+        has_specific_config_fix = any(('kubectl edit' in rec or 'kubectl patch' in rec)
+                                      for rec in self.recommendations)
+
+        # Check if firewall test passed (infrastructure is OK)
+        firewall_passed = any('firewall is ok' in rec.lower() or 'not blocking' in rec.lower()
+                             for rec in self.recommendations)
+
+        # If we have errors but no clear actionable root cause, suggest pod restart
+        if (has_tunnel_errors or has_routeagent_errors) and firewall_passed and not (
+            has_infrastructure_blocking or has_version_issue or
+            has_ha_issue or has_mtu_issue or has_specific_config_fix
+        ):
+            # Add pod restart recommendation as first step
+            print(f"\n{Colors.BOLD}=== Context-Aware Recommendation ==={Colors.ENDC}")
+            print(f"  {Colors.WARNING}No clear configuration error found in logs{Colors.ENDC}")
+            print(f"  Infrastructure is verified OK (firewall test passed)")
+            print(f"  If issue appeared after node reboots, updates, or other major activities,")
+            print(f"  this could be stale state in Submariner components.")
+
+            # Insert pod restart as the FIRST recommendation
+            restart_rec = (
+                "Restart Submariner pods on BOTH clusters (FIRST - simple workaround for potential stale state):\n"
+                f"      {Colors.OKCYAN}kubectl delete pods -n submariner-operator -l app=submariner-gateway{Colors.ENDC}\n"
+                f"      {Colors.OKCYAN}kubectl delete pods -n submariner-operator -l app=submariner-routeagent{Colors.ENDC}\n"
+                f"      {Colors.OKCYAN}kubectl delete pods -n submariner-operator -l app=submariner-globalnet{Colors.ENDC}\n"
+                "      Wait for pods to restart, then verify tunnel status:\n"
+                f"      {Colors.OKCYAN}kubectl get gateway -n submariner-operator{Colors.ENDC}"
+            )
+
+            # Remove vague "investigate" recommendations
+            self.recommendations = [rec for rec in self.recommendations
+                                   if 'investigate other' not in rec.lower()]
+
+            # Add restart recommendation at the beginning
+            self.recommendations.insert(0, restart_rec)
+
     def run(self):
         """Run full analysis"""
         print(f"\n{Colors.BOLD}Submariner Basic Diagnostic Analyzer{Colors.ENDC}")
@@ -2173,6 +2960,9 @@ class SubmarinerAnalyzer:
             print(f"\n{Colors.BOLD}Diagnostic Information:{Colors.ENDC}")
             print(f"  Timestamp: {manifest.get('Timestamp', 'unknown')}")
             print(f"  Issue: {manifest.get('Complaint', 'unknown')}")
+
+        # Check for collection errors
+        self.check_collection_errors()
 
         # Check for faulty states first
         has_faults = self.check_faulty_states()
@@ -2207,6 +2997,7 @@ class SubmarinerAnalyzer:
             cni_cluster2 = self.detect_cni("cluster2")
             if "OVN" in cni_cluster1 or "OVN" in cni_cluster2:
                 self.check_ovn_routing()
+                self.check_ovn_local_gateway_mode_issue()
                 self.check_main_table_routes()
 
             # Analyze tcpdump for tunnel issues
@@ -2218,6 +3009,9 @@ class SubmarinerAnalyzer:
 
             # Check gateway HA labels (critical: multiple active pods)
             self.analyze_gateway_ha_labels()
+
+            # Add context-aware recommendations if no clear root cause found
+            self.add_context_aware_recommendations()
 
         # Generate report
         self.generate_report()

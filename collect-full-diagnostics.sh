@@ -169,26 +169,76 @@ collect_tcpdump_from_cluster() {
     # Get Submariner configuration to determine capture filter
     CABLE_DRIVER=$(kubectl get submariner submariner -n submariner-operator --kubeconfig="${kubeconfig}" --context="${context}" -o jsonpath='{.spec.cableDriver}' 2>/dev/null)
     CABLE_DRIVER=${CABLE_DRIVER:-libreswan}  # Default to libreswan if not set
-    USING_IP=$(kubectl get submariner submariner -n submariner-operator --kubeconfig="${kubeconfig}" --context="${context}" -o jsonpath='{.status.gateways[0].connections[0].usingIP}' 2>/dev/null)
-    PRIVATE_IP=$(kubectl get submariner submariner -n submariner-operator --kubeconfig="${kubeconfig}" --context="${context}" -o jsonpath='{.status.gateways[0].connections[0].endpoint.private_ip}' 2>/dev/null)
+
+    # Get USING_IP and PRIVATE_IP from the active gateway (matching ACTIVE_GATEWAY_HOSTNAME)
+    # This ensures we capture the correct protocol (ESP vs NAT-T) for the active tunnel
+    if [ -n "$ACTIVE_GATEWAY_HOSTNAME" ]; then
+        USING_IP=$(kubectl get submariner submariner -n submariner-operator --kubeconfig="${kubeconfig}" --context="${context}" -o jsonpath="{.status.gateways[?(@.localEndpoint.hostname==\"${ACTIVE_GATEWAY_HOSTNAME}\")].connections[0].usingIP}" 2>/dev/null)
+        PRIVATE_IP=$(kubectl get submariner submariner -n submariner-operator --kubeconfig="${kubeconfig}" --context="${context}" -o jsonpath="{.status.gateways[?(@.localEndpoint.hostname==\"${ACTIVE_GATEWAY_HOSTNAME}\")].connections[0].endpoint.private_ip}" 2>/dev/null)
+    fi
+
+    # Fall back to first gateway if active gateway lookup failed
+    if [ -z "$USING_IP" ] || [ -z "$PRIVATE_IP" ]; then
+        USING_IP=$(kubectl get submariner submariner -n submariner-operator --kubeconfig="${kubeconfig}" --context="${context}" -o jsonpath='{.status.gateways[0].connections[0].usingIP}' 2>/dev/null)
+        PRIVATE_IP=$(kubectl get submariner submariner -n submariner-operator --kubeconfig="${kubeconfig}" --context="${context}" -o jsonpath='{.status.gateways[0].connections[0].endpoint.private_ip}' 2>/dev/null)
+    fi
+
     FORCE_UDP=$(kubectl get submariner submariner -n submariner-operator --kubeconfig="${kubeconfig}" --context="${context}" -o jsonpath='{.spec.ceIPSecForceUDPEncaps}' 2>/dev/null)
     NATT_PORT=$(kubectl get submariner submariner -n submariner-operator --kubeconfig="${kubeconfig}" --context="${context}" -o jsonpath='{.spec.ceIPSecNATTPort}' 2>/dev/null)
     NATT_PORT=${NATT_PORT:-4500}  # Default to 4500 if not set
 
-    # Determine capture filter based on cable driver and configuration
+    # Check if LoadBalancer service is being used
+    LB_TYPE=$(kubectl get svc submariner-gateway -n submariner-operator --kubeconfig="${kubeconfig}" --context="${context}" -o jsonpath='{.spec.type}' 2>/dev/null)
+    LB_EXTERNAL_TRAFFIC_POLICY=$(kubectl get svc submariner-gateway -n submariner-operator --kubeconfig="${kubeconfig}" --context="${context}" -o jsonpath='{.spec.externalTrafficPolicy}' 2>/dev/null)
+
+    # Get NodePorts if LoadBalancer service is used
+    if [ "$LB_TYPE" = "LoadBalancer" ]; then
+        NODEPORT_4500=$(kubectl get svc submariner-gateway -n submariner-operator --kubeconfig="${kubeconfig}" --context="${context}" -o jsonpath='{.spec.ports[?(@.port==4500)].nodePort}' 2>/dev/null)
+        NODEPORT_4490=$(kubectl get svc submariner-gateway -n submariner-operator --kubeconfig="${kubeconfig}" --context="${context}" -o jsonpath='{.spec.ports[?(@.port==4490)].nodePort}' 2>/dev/null)
+        LB_IP=$(kubectl get svc submariner-gateway -n submariner-operator --kubeconfig="${kubeconfig}" --context="${context}" -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null)
+
+        if [ -n "$NODEPORT_4500" ] && [ -n "$NODEPORT_4490" ]; then
+            echo "  ✓ LoadBalancer service detected:"
+            echo "    LB IP: ${LB_IP:-pending}"
+            echo "    NodePorts: ${NODEPORT_4500} (4500), ${NODEPORT_4490} (4490)"
+            echo "    External Traffic Policy: ${LB_EXTERNAL_TRAFFIC_POLICY:-Cluster}"
+        fi
+    fi
+
+    # Determine capture filters based on cable driver and configuration
+    # Separate tunnel traffic from ICMP for accurate analysis
     if [ "$CABLE_DRIVER" = "vxlan" ]; then
-        CAPTURE_FILTER="udp port ${NATT_PORT}"
-        echo "  Capture filter: ${CAPTURE_FILTER} (VXLAN cable driver)"
+        CAPTURE_FILTER_TUNNEL="udp port ${NATT_PORT}"
+        CAPTURE_FILTER_ICMP="icmp"
+        CAPTURE_FILTER="${CAPTURE_FILTER_TUNNEL} or ${CAPTURE_FILTER_ICMP}"
+        echo "  Capture filter (tunnel): ${CAPTURE_FILTER_TUNNEL} (VXLAN cable driver)"
+        echo "  Capture filter (ICMP): ${CAPTURE_FILTER_ICMP} (health check diagnostics)"
     elif [ "$FORCE_UDP" = "true" ] || [ "$USING_IP" != "$PRIVATE_IP" ]; then
-        CAPTURE_FILTER="udp port ${NATT_PORT}"
-        echo "  Capture filter: ${CAPTURE_FILTER} (UDP encapsulation detected)"
+        CAPTURE_FILTER_TUNNEL="udp port ${NATT_PORT}"
+        CAPTURE_FILTER_ICMP="icmp"
+        CAPTURE_FILTER="${CAPTURE_FILTER_TUNNEL} or ${CAPTURE_FILTER_ICMP}"
+        echo "  Capture filter (tunnel): ${CAPTURE_FILTER_TUNNEL} (UDP encapsulation)"
+        echo "  Capture filter (ICMP): ${CAPTURE_FILTER_ICMP} (health check diagnostics)"
     else
-        CAPTURE_FILTER="proto 50"
-        echo "  Capture filter: ${CAPTURE_FILTER} (ESP protocol)"
+        CAPTURE_FILTER_TUNNEL="proto 50"
+        CAPTURE_FILTER_ICMP="icmp"
+        CAPTURE_FILTER="${CAPTURE_FILTER_TUNNEL} or ${CAPTURE_FILTER_ICMP}"
+        echo "  Capture filter (tunnel): ${CAPTURE_FILTER_TUNNEL} (ESP protocol)"
+        echo "  Capture filter (ICMP): ${CAPTURE_FILTER_ICMP} (health check diagnostics)"
+    fi
+
+    # Add LoadBalancer NodePort filters if applicable
+    CAPTURE_FILTER_NODEPORTS=""
+    if [ "$LB_TYPE" = "LoadBalancer" ] && [ -n "$NODEPORT_4500" ] && [ -n "$NODEPORT_4490" ]; then
+        CAPTURE_FILTER_NODEPORTS="udp port ${NODEPORT_4500} or udp port ${NODEPORT_4490}"
+        CAPTURE_FILTER="${CAPTURE_FILTER} or ${CAPTURE_FILTER_NODEPORTS}"
+        echo "  Capture filter (LoadBalancer NodePorts): ${CAPTURE_FILTER_NODEPORTS}"
+        echo "    This captures traffic arriving at NodePorts before OVN forwarding"
     fi
 
     # Create DaemonSet YAML for tcpdump
-    cat <<EOF | kubectl apply --kubeconfig="${kubeconfig}" --context="${context}" -f - >/dev/null 2>&1
+    echo "  Applying tcpdump DaemonSet..."
+    cat <<EOF | kubectl apply --kubeconfig="${kubeconfig}" --context="${context}" -f -
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -216,7 +266,7 @@ spec:
         - -c
         - |
           echo "Starting tcpdump capture for ${capture_duration} seconds..."
-          timeout ${capture_duration} tcpdump -pnni any ${CAPTURE_FILTER} -w /tmp/gateway-traffic.pcap 2>&1
+          timeout ${capture_duration} tcpdump -pnni any "${CAPTURE_FILTER}" -w /tmp/gateway-traffic.pcap 2>&1
           echo "Capture complete. Generating analysis..."
 
           # Generate analysis text file inside the container
@@ -224,25 +274,89 @@ spec:
             echo "========================================="
             echo "TCPDUMP CAPTURE SUMMARY: ${cluster_name} Gateway"
             echo "Node: ${GATEWAY_NODE}"
-            echo "Capture Filter: ${CAPTURE_FILTER}"
+            echo "Capture Filter (tunnel): ${CAPTURE_FILTER_TUNNEL}"
+            echo "Capture Filter (ICMP): ${CAPTURE_FILTER_ICMP}"
+            if [ -n "${CAPTURE_FILTER_NODEPORTS}" ]; then
+              echo "Capture Filter (NodePorts): ${CAPTURE_FILTER_NODEPORTS}"
+              echo "LoadBalancer Service: Yes (IP: ${LB_IP:-pending})"
+              echo "  NodePort mappings: ${NODEPORT_4500} -> 4500, ${NODEPORT_4490} -> 4490"
+              echo "  External Traffic Policy: ${LB_EXTERNAL_TRAFFIC_POLICY:-Cluster}"
+            fi
             echo "Capture Duration: ${capture_duration} seconds"
             echo "========================================="
             echo ""
 
             # Count total packets
             TOTAL_PACKETS=\$(tcpdump -r /tmp/gateway-traffic.pcap -nn 2>/dev/null | wc -l)
+
+            # Count tunnel packets only (excluding ICMP)
+            TUNNEL_PACKETS=\$(tcpdump -r /tmp/gateway-traffic.pcap -nn "${CAPTURE_FILTER_TUNNEL}" 2>/dev/null | wc -l)
+
+            # Count ICMP packets
+            ICMP_PACKETS=\$(tcpdump -r /tmp/gateway-traffic.pcap -nn "${CAPTURE_FILTER_ICMP}" 2>/dev/null | wc -l)
+
+            # Count NodePort packets if LoadBalancer is used
+            if [ -n "${CAPTURE_FILTER_NODEPORTS}" ]; then
+              NODEPORT_PACKETS=\$(tcpdump -r /tmp/gateway-traffic.pcap -nn "${CAPTURE_FILTER_NODEPORTS}" 2>/dev/null | wc -l)
+            else
+              NODEPORT_PACKETS=0
+            fi
+
             echo "CAPTURE STATISTICS:"
             echo "  Total packets captured: \${TOTAL_PACKETS}"
+            echo "  Tunnel packets (${CAPTURE_FILTER_TUNNEL}): \${TUNNEL_PACKETS}"
+            echo "  ICMP packets: \${ICMP_PACKETS}"
+            if [ -n "${CAPTURE_FILTER_NODEPORTS}" ]; then
+              echo "  NodePort packets (${CAPTURE_FILTER_NODEPORTS}): \${NODEPORT_PACKETS}"
+              echo ""
+              echo "NODEPORT TRAFFIC ANALYSIS:"
+              if [ "\${NODEPORT_PACKETS}" -gt 0 ]; then
+                echo "  ✓ Traffic IS arriving on NodePorts (before OVN forwarding)"
+                if [ "\${TUNNEL_PACKETS}" -eq 0 ]; then
+                  echo "  ⚠ WARNING: NodePort traffic seen, but NO tunnel traffic on ports 4500/4490"
+                  echo "     This suggests OVN is NOT forwarding NodePort -> gateway pod ports"
+                fi
+              else
+                echo "  ✗ NO traffic arriving on NodePorts"
+                echo "     This suggests LoadBalancer is not sending traffic to this node,"
+                echo "     or traffic is blocked before reaching the node."
+              fi
+            fi
             echo ""
 
-            # Show first 50 packets with details
-            echo "FIRST 50 PACKETS (detailed):"
-            tcpdump -r /tmp/gateway-traffic.pcap -nnv 2>/dev/null | head -50
+            # Show first 50 packets with details (tunnel traffic only for analysis)
+            echo "FIRST 50 TUNNEL PACKETS (detailed):"
+            tcpdump -r /tmp/gateway-traffic.pcap -nnv "${CAPTURE_FILTER_TUNNEL}" 2>/dev/null | head -50
             echo ""
 
-            # Show unique source/destination pairs (using sed instead of awk for busybox compatibility)
-            echo "UNIQUE SOURCE -> DESTINATION PAIRS:"
-            tcpdump -r /tmp/gateway-traffic.pcap -nnq 2>/dev/null | sed -n 's/^.* \\([^ ]*\\) > \\([^ :]*\\).*/\\1 -> \\2/p' | sort | uniq -c | sort -rn
+            # Show unique source/destination pairs for tunnel traffic
+            echo "UNIQUE SOURCE -> DESTINATION PAIRS (tunnel traffic):"
+            tcpdump -r /tmp/gateway-traffic.pcap -nnq "${CAPTURE_FILTER_TUNNEL}" 2>/dev/null | sed -n 's/^.* \\([^ ]*\\) > \\([^ :]*\\).*/\\1 -> \\2/p' | sort | uniq -c | sort -rn
+            echo ""
+
+            # Optionally show ICMP summary
+            if [ "\${ICMP_PACKETS}" -gt 0 ]; then
+              echo "ICMP PACKET SUMMARY:"
+              tcpdump -r /tmp/gateway-traffic.pcap -nnq "${CAPTURE_FILTER_ICMP}" 2>/dev/null | head -20
+              echo ""
+            fi
+
+            # Show NodePort traffic details if LoadBalancer is used
+            if [ -n "${CAPTURE_FILTER_NODEPORTS}" ] && [ "\${NODEPORT_PACKETS}" -gt 0 ]; then
+              echo "NODEPORT TRAFFIC DETAILS (first 30 packets):"
+              tcpdump -r /tmp/gateway-traffic.pcap -nnv "${CAPTURE_FILTER_NODEPORTS}" 2>/dev/null | head -30
+              echo ""
+
+              echo "NODEPORT SOURCE IPs (shows where traffic is coming from):"
+              tcpdump -r /tmp/gateway-traffic.pcap -nnq "${CAPTURE_FILTER_NODEPORTS}" 2>/dev/null | \
+                sed -n 's/^.* \\([^ ]*\\) > \\([^ :]*\\).*/\\1/p' | sort | uniq -c | sort -rn | head -10
+              echo ""
+
+              echo "NODEPORT DESTINATION IPs (shows which node IPs receive traffic):"
+              tcpdump -r /tmp/gateway-traffic.pcap -nnq "${CAPTURE_FILTER_NODEPORTS}" 2>/dev/null | \
+                sed -n 's/^.* \\([^ ]*\\) > \\([^ :]*\\).*/\\2/p' | sort | uniq -c | sort -rn | head -10
+              echo ""
+            fi
 
           } > /tmp/gateway-analysis.txt 2>&1
 
@@ -278,7 +392,9 @@ EOF
     sleep 5
 
     # Wait for pod to be ready
-    kubectl wait --for=condition=Ready pod -l app=submariner-tcpdump-collector -n submariner-operator --kubeconfig="${kubeconfig}" --context="${context}" --timeout=30s >/dev/null 2>&1
+    if ! kubectl wait --for=condition=Ready pod -l app=submariner-tcpdump-collector -n submariner-operator --kubeconfig="${kubeconfig}" --context="${context}" --timeout=30s 2>&1; then
+        echo "  ⚠ Warning: Pod did not become ready within 30s, will attempt to continue..."
+    fi
 
     # Get the tcpdump pod running on the selected gateway node
     TCPDUMP_POD=$(kubectl get pods -n submariner-operator -l app=submariner-tcpdump-collector --kubeconfig="${kubeconfig}" --context="${context}" -o jsonpath="{.items[?(@.spec.nodeName==\"${GATEWAY_NODE}\")].metadata.name}" 2>/dev/null)
@@ -297,10 +413,10 @@ EOF
 
     # Extract pcap file (using kubectl exec instead of cp since nettest image doesn't have tar)
     echo "  Extracting files from ${cluster_name}..."
-    kubectl exec -n submariner-operator "${TCPDUMP_POD}" --kubeconfig="${kubeconfig}" --context="${context}" -- cat /tmp/gateway-traffic.pcap > "${tcpdump_dir}/${cluster_name}-gateway-${GATEWAY_NODE}.pcap" 2>/dev/null
+    kubectl exec -n submariner-operator "${TCPDUMP_POD}" --kubeconfig="${kubeconfig}" --context="${context}" -- cat /tmp/gateway-traffic.pcap > "${tcpdump_dir}/${cluster_name}-gateway-${GATEWAY_NODE}.pcap"
 
     # Extract analysis file
-    kubectl exec -n submariner-operator "${TCPDUMP_POD}" --kubeconfig="${kubeconfig}" --context="${context}" -- cat /tmp/gateway-analysis.txt > "${tcpdump_dir}/${cluster_name}-gateway-${GATEWAY_NODE}-analysis.txt" 2>/dev/null
+    kubectl exec -n submariner-operator "${TCPDUMP_POD}" --kubeconfig="${kubeconfig}" --context="${context}" -- cat /tmp/gateway-analysis.txt > "${tcpdump_dir}/${cluster_name}-gateway-${GATEWAY_NODE}-analysis.txt"
 
     # Check if files were extracted successfully
     if [ -f "${tcpdump_dir}/${cluster_name}-gateway-${GATEWAY_NODE}.pcap" ]; then
@@ -846,6 +962,10 @@ echo ""
 
 mkdir -p "${OUTPUT_DIR}"
 
+# Set up collection logging - capture all output to both console and log file
+COLLECTION_LOG="${OUTPUT_DIR}/collection.log"
+exec > >(tee -a "${COLLECTION_LOG}") 2>&1
+
 COLLECTION_START_TIME=$(date +%s)
 echo "========================================="
 echo "Collecting Submariner diagnostics..."
@@ -854,6 +974,8 @@ echo "========================================="
 echo ""
 echo "Timestamp: ${TIMESTAMP}" > "${OUTPUT_DIR}/manifest.txt"
 echo "Complaint: ${COMPLAINT}" >> "${OUTPUT_DIR}/manifest.txt"
+echo "" >> "${OUTPUT_DIR}/manifest.txt"
+echo "Collection Log: See collection.log for detailed output and any errors" >> "${OUTPUT_DIR}/manifest.txt"
 echo "" >> "${OUTPUT_DIR}/manifest.txt"
 
 # Document context renaming if it occurred
@@ -1223,11 +1345,12 @@ echo "Tunnel status:"
 echo "  Cluster1: ${TUNNEL_STATUS_CLUSTER1}"
 echo "  Cluster2: ${TUNNEL_STATUS_CLUSTER2}"
 
-# Skip subctl verify entirely if tunnel is not connected on BOTH clusters
-if [ "$TUNNEL_STATUS_CLUSTER1" != "connected" ] || [ "$TUNNEL_STATUS_CLUSTER2" != "connected" ]; then
+# Skip subctl verify only if tunnel is not connected on BOTH clusters
+# If one tunnel is connected but the other is not, we still run verification to diagnose the asymmetry
+if [ "$TUNNEL_STATUS_CLUSTER1" != "connected" ] && [ "$TUNNEL_STATUS_CLUSTER2" != "connected" ]; then
     echo ""
-    echo "  ✗ Tunnel NOT connected on both clusters - skipping 'subctl verify'"
-    echo "  → Reason: Need to fix tunnel connectivity first before running verify tests"
+    echo "  ✗ Tunnel NOT connected on either cluster - skipping 'subctl verify'"
+    echo "  → Reason: Need to establish basic tunnel connectivity first"
     echo "  → Alternative: tcpdump data provides packet-level diagnostics (see tcpdump/ directory)"
     echo ""
 
@@ -1236,15 +1359,15 @@ if [ "$TUNNEL_STATUS_CLUSTER1" != "connected" ] || [ "$TUNNEL_STATUS_CLUSTER2" !
     echo "CONNECTIVITY VERIFICATION SKIPPED" >> "${OUTPUT_DIR}/verify/connectivity.txt"
     echo "========================================" >> "${OUTPUT_DIR}/verify/connectivity.txt"
     echo "" >> "${OUTPUT_DIR}/verify/connectivity.txt"
-    echo "Connectivity verification was skipped because tunnel status is not 'connected' on both clusters." >> "${OUTPUT_DIR}/verify/connectivity.txt"
+    echo "Connectivity verification was skipped because tunnel status is not 'connected' on either cluster." >> "${OUTPUT_DIR}/verify/connectivity.txt"
     echo "" >> "${OUTPUT_DIR}/verify/connectivity.txt"
     echo "Tunnel status:" >> "${OUTPUT_DIR}/verify/connectivity.txt"
     echo "  Cluster1: ${TUNNEL_STATUS_CLUSTER1}" >> "${OUTPUT_DIR}/verify/connectivity.txt"
     echo "  Cluster2: ${TUNNEL_STATUS_CLUSTER2}" >> "${OUTPUT_DIR}/verify/connectivity.txt"
     echo "" >> "${OUTPUT_DIR}/verify/connectivity.txt"
     echo "Why skipped:" >> "${OUTPUT_DIR}/verify/connectivity.txt"
-    echo "  - Tunnel must be 'connected' on BOTH clusters to run verify tests" >> "${OUTPUT_DIR}/verify/connectivity.txt"
-    echo "  - Focus should be on fixing tunnel connectivity first" >> "${OUTPUT_DIR}/verify/connectivity.txt"
+    echo "  - Both tunnels are not connected - no connectivity possible" >> "${OUTPUT_DIR}/verify/connectivity.txt"
+    echo "  - Focus should be on establishing basic tunnel connectivity first" >> "${OUTPUT_DIR}/verify/connectivity.txt"
     echo "  - tcpdump packet captures (if collected) provide better diagnostics for tunnel failures" >> "${OUTPUT_DIR}/verify/connectivity.txt"
     echo "" >> "${OUTPUT_DIR}/verify/connectivity.txt"
     echo "Recommended diagnostics for tunnel failures:" >> "${OUTPUT_DIR}/verify/connectivity.txt"
@@ -1259,7 +1382,7 @@ if [ "$TUNNEL_STATUS_CLUSTER1" != "connected" ] || [ "$TUNNEL_STATUS_CLUSTER2" !
 
     # Skip the entire verify section
     SKIP_VERIFY=true
-else
+elif [ "$TUNNEL_STATUS_CLUSTER1" = "connected" ] && [ "$TUNNEL_STATUS_CLUSTER2" = "connected" ]; then
     echo ""
     echo "  ✓ Tunnel status: connected on BOTH clusters"
     echo "  → Will run full connectivity verification tests (including MTU test)"
@@ -1267,6 +1390,15 @@ else
     SKIP_VERIFY=false
     VERIFY_CONNECTIVITY_FLAG="connectivity"
     RUN_MTU_TEST=true
+else
+    echo ""
+    echo "  ⚠ Asymmetric tunnel status detected (connected on one cluster, not on the other)"
+    echo "  → Will run connectivity verification to diagnose the issue"
+    echo "  → Note: This may indicate a SNAT or routing issue affecting one direction"
+
+    SKIP_VERIFY=false
+    VERIFY_CONNECTIVITY_FLAG="connectivity"
+    RUN_MTU_TEST=false
 fi
 
 # Only run verify tests if tunnel is connected on at least one cluster
@@ -1623,22 +1755,27 @@ if [ "$SKIP_VERIFY" = "false" ]; then
         # First check if test passed (avoid false positives from "0 Failed" in success summaries)
         if grep -qE 'SUCCESS!|[0-9]+\s+Passed.*0\s+Failed' "${OUTPUT_DIR}/verify/connectivity.txt" 2>/dev/null; then
             CONNECTIVITY_FAILED=false
-        # Only if not successful, check for actual failures
-        elif grep -qE 'FAIL\b|timed out|stopped early|[1-9][0-9]*\s+Failed' "${OUTPUT_DIR}/verify/connectivity.txt" 2>/dev/null; then
+        # Only if not successful, check for actual failures (including timeouts)
+        elif grep -qE 'FAIL\b|timed out|terminated after|stopped early|[1-9][0-9]*\s+Failed' "${OUTPUT_DIR}/verify/connectivity.txt" 2>/dev/null; then
             CONNECTIVITY_FAILED=true
         fi
     fi
 
     # Check if small packet tests also failed (to rule out MTU issues)
     SMALL_PACKET_FAILED=false
+    SMALL_PACKET_STATUS="not-run"
     if [ -f "${OUTPUT_DIR}/verify/connectivity-small-packet.txt" ]; then
         # Check if test was actually run (not skipped)
-        if ! grep -qE "SKIPPED|MTU TEST SKIPPED|SMALL PACKET TEST SKIPPED" "${OUTPUT_DIR}/verify/connectivity-small-packet.txt" 2>/dev/null; then
+        if grep -qE "SKIPPED|MTU TEST SKIPPED|SMALL PACKET TEST SKIPPED" "${OUTPUT_DIR}/verify/connectivity-small-packet.txt" 2>/dev/null; then
+            SMALL_PACKET_STATUS="skipped"
+        else
             # Test was run - check if it failed (avoid false positives from "0 Failed" in success summaries)
             if grep -qE 'SUCCESS!|[0-9]+\s+Passed.*0\s+Failed' "${OUTPUT_DIR}/verify/connectivity-small-packet.txt" 2>/dev/null; then
+                SMALL_PACKET_STATUS="passed"
                 SMALL_PACKET_FAILED=false
-            # Only if not successful, check for actual failures
-            elif grep -qE 'FAIL\b|timed out|stopped early|[1-9][0-9]*\s+Failed' "${OUTPUT_DIR}/verify/connectivity-small-packet.txt" 2>/dev/null; then
+            # Only if not successful, check for actual failures (including timeouts)
+            elif grep -qE 'FAIL\b|timed out|terminated after|stopped early|[1-9][0-9]*\s+Failed' "${OUTPUT_DIR}/verify/connectivity-small-packet.txt" 2>/dev/null; then
+                SMALL_PACKET_STATUS="failed"
                 SMALL_PACKET_FAILED=true
             fi
         fi
@@ -1705,9 +1842,14 @@ if [ "$SKIP_VERIFY" = "false" ]; then
         echo "  End time: $(date '+%Y-%m-%d %H:%M:%S')"
     elif [ "$CONNECTIVITY_FAILED" = "false" ]; then
         echo "  → Regular connectivity tests passed - no need for OVNK-specific test"
-    elif [ "$CONNECTIVITY_FAILED" = "true" ] && [ "$SMALL_PACKET_FAILED" = "false" ]; then
+    elif [ "$CONNECTIVITY_FAILED" = "true" ] && [ "$SMALL_PACKET_STATUS" = "passed" ]; then
         echo "  → Small packet test passed but regular failed - this is an MTU issue, not OVNK SNAT"
         echo "     Skipping OVNK-specific test (MTU issue already detected)"
+    elif [ "$CONNECTIVITY_FAILED" = "true" ] && [ "$SMALL_PACKET_STATUS" = "skipped" ]; then
+        echo "  → Small packet test was skipped - cannot classify this as MTU or OVNK SNAT from this run"
+        echo "     In asymmetric tunnel cases, review routing/SNAT guidance and rerun with --skip-src-ip-check if needed"
+    elif [ "$CONNECTIVITY_FAILED" = "true" ] && [ "$SMALL_PACKET_STATUS" = "not-run" ]; then
+        echo "  → Small packet test did not run - cannot classify this as MTU or OVNK SNAT from this run"
     elif [ "$OVNK_DETECTED" = "false" ]; then
         echo "  → OVNK CNI not detected - skipping OVNK-specific test"
     else
