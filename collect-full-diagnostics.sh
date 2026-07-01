@@ -26,6 +26,21 @@ trap cleanup_temp_files EXIT INT TERM
 
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 OUTPUT_DIR="submariner-diagnostics-${TIMESTAMP}"
+SANITIZE_MODE=false
+
+# Parse arguments - check for --sanitize flag
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --sanitize)
+            SANITIZE_MODE=true
+            shift
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
 CLUSTER1_CONTEXT="$1"
 KUBECONFIG1="$2"
 CLUSTER2_CONTEXT="$3"
@@ -33,7 +48,10 @@ KUBECONFIG2="$4"
 COMPLAINT="$5"
 
 show_usage() {
-    echo "Usage: $0 <cluster1-context> <cluster1-kubeconfig> <cluster2-context> <cluster2-kubeconfig> [issue-description]"
+    echo "Usage: $0 [--sanitize] <cluster1-context> <cluster1-kubeconfig> <cluster2-context> <cluster2-kubeconfig> [issue-description]"
+    echo ""
+    echo "Options:"
+    echo "  --sanitize           - Sanitize IP addresses and domain names in collected diagnostics"
     echo ""
     echo "Arguments:"
     echo "  cluster1-context     - Context name for cluster 1 (required)"
@@ -50,6 +68,9 @@ show_usage() {
     echo ""
     echo "  # Single kubeconfig with multiple contexts:"
     echo "  $0 context1 /path/to/kubeconfig context2 /path/to/kubeconfig 'route agent degraded'"
+    echo ""
+    echo "  # With sanitization:"
+    echo "  $0 --sanitize context1 /path/to/kubeconfig context2 /path/to/kubeconfig 'tunnel not connected'"
     echo ""
     return 1 2>/dev/null || exit 1
 }
@@ -73,6 +94,31 @@ sanitize_context_name() {
     local context="$1"
     # Replace illegal characters (: / \ @) with dash
     echo "$context" | sed 's/[:/\\@]/-/g'
+}
+
+# Function to sanitize all collected files using Python script
+sanitize_diagnostics() {
+    local sanitize_script="$(dirname "$0")/sanitize-diagnostics.py"
+
+    # Check if Python sanitizer exists
+    if [ ! -f "$sanitize_script" ]; then
+        echo "ERROR: Sanitization script not found: $sanitize_script"
+        return 1
+    fi
+
+    # Check if python3 is available
+    if ! command -v python3 &> /dev/null; then
+        echo "ERROR: python3 not found. Sanitization requires Python 3."
+        return 1
+    fi
+
+    # Run Python sanitizer and check exit code
+    if ! python3 "$sanitize_script" "$OUTPUT_DIR"; then
+        echo "ERROR: Sanitization failed"
+        return 1
+    fi
+
+    return 0
 }
 
 # Function to collect diagnostics from a single cluster
@@ -187,6 +233,24 @@ collect_tcpdump_from_cluster() {
     NATT_PORT=$(kubectl get submariner submariner -n submariner-operator --kubeconfig="${kubeconfig}" --context="${context}" -o jsonpath='{.spec.ceIPSecNATTPort}' 2>/dev/null)
     NATT_PORT=${NATT_PORT:-4500}  # Default to 4500 if not set
 
+    # Check if LoadBalancer service is being used
+    LB_TYPE=$(kubectl get svc submariner-gateway -n submariner-operator --kubeconfig="${kubeconfig}" --context="${context}" -o jsonpath='{.spec.type}' 2>/dev/null)
+    LB_EXTERNAL_TRAFFIC_POLICY=$(kubectl get svc submariner-gateway -n submariner-operator --kubeconfig="${kubeconfig}" --context="${context}" -o jsonpath='{.spec.externalTrafficPolicy}' 2>/dev/null)
+
+    # Get NodePorts if LoadBalancer service is used
+    if [ "$LB_TYPE" = "LoadBalancer" ]; then
+        NODEPORT_4500=$(kubectl get svc submariner-gateway -n submariner-operator --kubeconfig="${kubeconfig}" --context="${context}" -o jsonpath='{.spec.ports[?(@.port==4500)].nodePort}' 2>/dev/null)
+        NODEPORT_4490=$(kubectl get svc submariner-gateway -n submariner-operator --kubeconfig="${kubeconfig}" --context="${context}" -o jsonpath='{.spec.ports[?(@.port==4490)].nodePort}' 2>/dev/null)
+        LB_IP=$(kubectl get svc submariner-gateway -n submariner-operator --kubeconfig="${kubeconfig}" --context="${context}" -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null)
+
+        if [ -n "$NODEPORT_4500" ] && [ -n "$NODEPORT_4490" ]; then
+            echo "  ✓ LoadBalancer service detected:"
+            echo "    LB IP: ${LB_IP:-pending}"
+            echo "    NodePorts: ${NODEPORT_4500} (4500), ${NODEPORT_4490} (4490)"
+            echo "    External Traffic Policy: ${LB_EXTERNAL_TRAFFIC_POLICY:-Cluster}"
+        fi
+    fi
+
     # Determine capture filters based on cable driver and configuration
     # Separate tunnel traffic from ICMP for accurate analysis
     if [ "$CABLE_DRIVER" = "vxlan" ]; then
@@ -207,6 +271,15 @@ collect_tcpdump_from_cluster() {
         CAPTURE_FILTER="${CAPTURE_FILTER_TUNNEL} or ${CAPTURE_FILTER_ICMP}"
         echo "  Capture filter (tunnel): ${CAPTURE_FILTER_TUNNEL} (ESP protocol)"
         echo "  Capture filter (ICMP): ${CAPTURE_FILTER_ICMP} (health check diagnostics)"
+    fi
+
+    # Add LoadBalancer NodePort filters if applicable
+    CAPTURE_FILTER_NODEPORTS=""
+    if [ "$LB_TYPE" = "LoadBalancer" ] && [ -n "$NODEPORT_4500" ] && [ -n "$NODEPORT_4490" ]; then
+        CAPTURE_FILTER_NODEPORTS="udp port ${NODEPORT_4500} or udp port ${NODEPORT_4490}"
+        CAPTURE_FILTER="${CAPTURE_FILTER} or ${CAPTURE_FILTER_NODEPORTS}"
+        echo "  Capture filter (LoadBalancer NodePorts): ${CAPTURE_FILTER_NODEPORTS}"
+        echo "    This captures traffic arriving at NodePorts before OVN forwarding"
     fi
 
     # Create DaemonSet YAML for tcpdump
@@ -249,6 +322,12 @@ spec:
             echo "Node: ${GATEWAY_NODE}"
             echo "Capture Filter (tunnel): ${CAPTURE_FILTER_TUNNEL}"
             echo "Capture Filter (ICMP): ${CAPTURE_FILTER_ICMP}"
+            if [ -n "${CAPTURE_FILTER_NODEPORTS}" ]; then
+              echo "Capture Filter (NodePorts): ${CAPTURE_FILTER_NODEPORTS}"
+              echo "LoadBalancer Service: Yes (IP: ${LB_IP:-pending})"
+              echo "  NodePort mappings: ${NODEPORT_4500} -> 4500, ${NODEPORT_4490} -> 4490"
+              echo "  External Traffic Policy: ${LB_EXTERNAL_TRAFFIC_POLICY:-Cluster}"
+            fi
             echo "Capture Duration: ${capture_duration} seconds"
             echo "========================================="
             echo ""
@@ -262,10 +341,33 @@ spec:
             # Count ICMP packets
             ICMP_PACKETS=\$(tcpdump -r /tmp/gateway-traffic.pcap -nn "${CAPTURE_FILTER_ICMP}" 2>/dev/null | wc -l)
 
+            # Count NodePort packets if LoadBalancer is used
+            if [ -n "${CAPTURE_FILTER_NODEPORTS}" ]; then
+              NODEPORT_PACKETS=\$(tcpdump -r /tmp/gateway-traffic.pcap -nn "${CAPTURE_FILTER_NODEPORTS}" 2>/dev/null | wc -l)
+            else
+              NODEPORT_PACKETS=0
+            fi
+
             echo "CAPTURE STATISTICS:"
             echo "  Total packets captured: \${TOTAL_PACKETS}"
             echo "  Tunnel packets (${CAPTURE_FILTER_TUNNEL}): \${TUNNEL_PACKETS}"
             echo "  ICMP packets: \${ICMP_PACKETS}"
+            if [ -n "${CAPTURE_FILTER_NODEPORTS}" ]; then
+              echo "  NodePort packets (${CAPTURE_FILTER_NODEPORTS}): \${NODEPORT_PACKETS}"
+              echo ""
+              echo "NODEPORT TRAFFIC ANALYSIS:"
+              if [ "\${NODEPORT_PACKETS}" -gt 0 ]; then
+                echo "  ✓ Traffic IS arriving on NodePorts (before OVN forwarding)"
+                if [ "\${TUNNEL_PACKETS}" -eq 0 ]; then
+                  echo "  ⚠ WARNING: NodePort traffic seen, but NO tunnel traffic on ports 4500/4490"
+                  echo "     This suggests OVN is NOT forwarding NodePort -> gateway pod ports"
+                fi
+              else
+                echo "  ✗ NO traffic arriving on NodePorts"
+                echo "     This suggests LoadBalancer is not sending traffic to this node,"
+                echo "     or traffic is blocked before reaching the node."
+              fi
+            fi
             echo ""
 
             # Show first 50 packets with details (tunnel traffic only for analysis)
@@ -282,6 +384,24 @@ spec:
             if [ "\${ICMP_PACKETS}" -gt 0 ]; then
               echo "ICMP PACKET SUMMARY:"
               tcpdump -r /tmp/gateway-traffic.pcap -nnq "${CAPTURE_FILTER_ICMP}" 2>/dev/null | head -20
+              echo ""
+            fi
+
+            # Show NodePort traffic details if LoadBalancer is used
+            if [ -n "${CAPTURE_FILTER_NODEPORTS}" ] && [ "\${NODEPORT_PACKETS}" -gt 0 ]; then
+              echo "NODEPORT TRAFFIC DETAILS (first 30 packets):"
+              tcpdump -r /tmp/gateway-traffic.pcap -nnv "${CAPTURE_FILTER_NODEPORTS}" 2>/dev/null | head -30
+              echo ""
+
+              echo "NODEPORT SOURCE IPs (shows where traffic is coming from):"
+              tcpdump -r /tmp/gateway-traffic.pcap -nnq "${CAPTURE_FILTER_NODEPORTS}" 2>/dev/null | \
+                sed -n 's/^.* \\([^ ]*\\) > \\([^ :]*\\).*/\\1/p' | sort | uniq -c | sort -rn | head -10
+              echo ""
+
+              echo "NODEPORT DESTINATION IPs (shows which node IPs receive traffic):"
+              tcpdump -r /tmp/gateway-traffic.pcap -nnq "${CAPTURE_FILTER_NODEPORTS}" 2>/dev/null | \
+                sed -n 's/^.* \\([^ ]*\\) > \\([^ :]*\\).*/\\2/p' | sort | uniq -c | sort -rn | head -10
+              echo ""
             fi
 
           } > /tmp/gateway-analysis.txt 2>&1
@@ -1784,6 +1904,18 @@ if [ "$SKIP_VERIFY" = "false" ]; then
 
     # Cleanup merged kubeconfig
     rm -f "${MERGED_KUBECONFIG}"
+fi
+
+# Sanitize diagnostics if requested
+if [ "$SANITIZE_MODE" = true ]; then
+    if ! sanitize_diagnostics; then
+        echo "ERROR: Sanitization failed. Aborting to prevent leaking sensitive data."
+        return 1 2>/dev/null || exit 1
+    fi
+
+    # Remove mapping files before creating tarball (they contain original sensitive data)
+    echo "  Removing mapping files (contain original sensitive data)..."
+    rm -f "${OUTPUT_DIR}/ip-mappings.txt" "${OUTPUT_DIR}/domain-mappings.txt"
 fi
 
 # Create tarball

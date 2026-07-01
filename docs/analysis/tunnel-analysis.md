@@ -254,6 +254,47 @@ Capture Filter: udp port 4500 or icmp
 3. **If ICMP arrives but tunnel still error:** Configuration issue, not infrastructure blocking
 4. **If NO ICMP arrives:** Investigate further (could be infrastructure or health check IP issue)
 
+#### Enhanced tcpdump collection (with NodePort capture)
+
+**NEW:** If diagnostic was collected with LoadBalancer-enhanced version:
+
+```text
+Capture Filter: udp port 4500 or icmp or udp port 30443 or udp port 32567
+LoadBalancer Service: Yes (IP: 169.63.205.145)
+  NodePort mappings: 30443 -> 4500, 32567 -> 4490
+```
+
+**Enhanced statistics available:**
+
+```text
+CAPTURE STATISTICS:
+  Tunnel packets (udp port 4500): 0
+  ICMP packets: 12
+  NodePort packets (udp port 30443 or udp port 32567): 523
+
+NODEPORT TRAFFIC ANALYSIS:
+  ✓ Traffic IS arriving on NodePorts (before OVN forwarding)
+  ⚠ WARNING: NodePort traffic seen, but NO tunnel traffic on ports 4500/4490
+     This suggests OVN is NOT forwarding NodePort -> gateway pod ports
+```
+
+**Analysis approach with NodePort capture:**
+
+| NodePort Packets | Tunnel Packets | Failure Segment Identified              |
+| ---------------- | -------------- | --------------------------------------- |
+| 0                | 0              | LoadBalancer → NodePort                 |
+| > 0              | 0              | NodePort → Gateway Pod (OVN/CNI)        |
+| > 0              | > 0            | Normal operation (traffic flowing)      |
+| 0                | > 0            | Unexpected (investigate pod network)    |
+
+**Important:** Both failure segments are **outside Submariner's scope**:
+
+1. **LoadBalancer → NodePort segment** - Involves cloud provider LoadBalancer, security groups, firewall rules, network policies
+2. **NodePort → Gateway Pod segment** - Involves CNI (OVN-Kubernetes) or platform networking layer
+
+The tcpdump analysis **identifies which segment is failing** to focus the investigation, but resolving these issues
+requires troubleshooting the infrastructure/platform components, not Submariner itself.
+
 ### Common LoadBalancer Issues
 
 #### 1. Wrong externalTrafficPolicy for Hosted Clusters

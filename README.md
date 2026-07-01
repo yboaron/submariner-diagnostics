@@ -40,7 +40,10 @@ pip install pyyaml
 
 - `kubectl` - [Installation Guide](https://kubernetes.io/docs/tasks/tools/)
 - `subctl` - [Installation Guide](https://github.com/submariner-io/subctl)
-- `python3` and `pyyaml` - Only needed for basic analysis (optional)
+- `python3` - Optional, needed for:
+  - Basic analysis (`analyze-basic.py`)
+  - Sanitization (`--sanitize` flag)
+- `pyyaml` - Only needed for basic analysis (install with `pip install pyyaml`)
 - Access to both Submariner clusters with valid kubeconfig files
 
 ## Quick Start
@@ -48,8 +51,12 @@ pip install pyyaml
 ### 1. Collect Diagnostics
 
 ```bash
-./collect-full-diagnostics.sh <cluster1-context> <cluster1-kubeconfig> <cluster2-context> <cluster2-kubeconfig> [issue-description]
+./collect-full-diagnostics.sh [--sanitize] <cluster1-context> <cluster1-kubeconfig> <cluster2-context> <cluster2-kubeconfig> [issue-description]
 ```
+
+#### Options
+
+- `--sanitize`: Sanitize IP addresses and domain names in collected diagnostics (optional)
 
 #### Parameters
 
@@ -74,6 +81,12 @@ pip install pyyaml
   context-cluster2 /path/to/merged-kubeconfig \
   "connectivity issues"
 
+# With sanitization (for sharing diagnostics externally)
+./collect-full-diagnostics.sh --sanitize \
+  context-cluster1 /path/to/merged-kubeconfig \
+  context-cluster2 /path/to/merged-kubeconfig \
+  "connectivity issues"
+
 # Without issue description (defaults to "undefined")
 ./collect-full-diagnostics.sh \
   prod-east /path/to/kubeconfig-east \
@@ -81,6 +94,20 @@ pip install pyyaml
 ```
 
 **Output:** `submariner-diagnostics-TIMESTAMP.tar.gz`
+
+#### Sanitization
+
+When `--sanitize` is used:
+
+- **IP addresses** are replaced with context-aware placeholders:
+  - `PUBLIC-IP-N` for public IPs
+  - `PRIVATE-IP-N` for RFC1918 private IPs
+  - `POD-IP-N` for pod CIDRs
+  - `SVC-IP-N` for service CIDRs
+- **Domain names** are replaced with `DOMAIN-N` placeholders
+- Mapping files (`ip-mappings.txt`, `domain-mappings.txt`) are included for reference
+- Diagnostic value is preserved (traffic flow remains understandable)
+- No changes to analyzer needed (works with both sanitized and non-sanitized data)
 
 ### 2. Analyze (Basic - No AI)
 
