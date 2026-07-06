@@ -1,9 +1,8 @@
 # RouteAgent Health Analysis
 
-How to analyze RouteAgent status and OVN-specific routing configuration.
+How to analyze RouteAgent status and understand datapath segmentation.
 
-> **See also:** [datapath-architecture.md](datapath-architecture.md) for detailed explanation of Submariner's asymmetric datapath
-> (egress vs ingress paths differ).
+> **Purpose:** Determine which datapath segment is failing to focus investigation correctly.
 
 ## CRITICAL: Understanding Datapath Segments
 
@@ -14,327 +13,400 @@ How to analyze RouteAgent status and OVN-specific routing configuration.
 ```text
 Cross-cluster pod connectivity requires TWO segments:
 
-Segment 1: WorkerNode → LocalGW (intra-cluster routing)
-Segment 2: LocalGW → RemoteGW (inter-cluster tunnel)
+Segment 1: Non-GW Node → Local-GW (intra-cluster routing)
+Segment 2: Local-GW → Remote-GW (inter-cluster tunnel)
 
-Complete path: WorkerNode → LocalGW → RemoteGW → RemotePod
+Complete path: Non-GW Node → Local-GW → Remote-GW
 ```
 
 ### Health Check Coverage
 
-**Gateway health check (Gateway CR status):**
-
-- Tests: LocalGW → RemoteGW (tunnel segment only)
-- Uses: Health check IP ping between gateways
+**Gateway CR health check:**
+- **Tests:** Local-GW → Remote-GW (Segment 2 only)
+- **Method:** Health check IP ping between gateways
 - **Limitation:** Does NOT test local routing from worker nodes
 
-**RouteAgent health check (RouteAgent CR status):**
+**RouteAgent CR health check:**
+- **Tests:** Non-GW → Local-GW → Remote-GW (Segments 1+2)
+- **Method:** Health check IP ping from worker nodes through gateway to remote
+- **Advantage:** Tests complete path
 
-- Tests: WorkerNode → LocalGW → RemoteGW (full datapath)
-- Uses: Health check IP ping from worker nodes through local gateway to remote gateway
-- **Advantage:** Tests both segments together
+## Decision Matrix: Which Segment is Broken?
 
-## Basic RouteAgent Health
+| Gateway CR Status | RouteAgent CR Status | Faulty Segment | Investigation Focus |
+| ----------------- | -------------------- | -------------- | ------------------- |
+| connected | connected | ✅ None | Datapath healthy - no OVN investigation needed |
+| connected | error | 🔴 Segment 1 | Non-GW → Local-GW routing (IP rules, table 150, OVN policies) |
+| error | connected | ⚠️ Unusual | Gateway health check fails but full path works - investigate GW check |
+| error | error | 🔴 Segment 2 | Local-GW → Remote-GW tunnel (IPsec, firewall, cable driver) |
+
+### Early Exit Optimization
+
+**If Gateway=connected AND RouteAgent=connected:**
+- ✅ **STOP** - Datapath is fully healthy
+- No need to check OVN configuration
+- No need to analyze tcpdump
+- Report: "Submariner L3 connectivity appears healthy"
+
+**If Gateway=connected AND RouteAgent=error:**
+- 🔍 Focus ONLY on Segment 1 (local routing)
+- Tunnel is working (Gateway CR proves it)
+- Don't waste time on tunnel/firewall investigation
+- Check: IP rules, table 150 routes, OVN policies
+
+**If Gateway=error:**
+- 🔍 Focus on Segment 2 FIRST (tunnel)
+- Fix tunnel before investigating local routing
+- See: [tunnel-analysis.md](tunnel-analysis.md)
+
+## RouteAgent Status Analysis
 
 ### Data Source
 
-File: `cluster*/routeagents.yaml`
+**File:** `cluster*/routeagents.yaml`
 
-### Check RouteAgent Status
+**Format:**
+```yaml
+apiVersion: v1
+items:
+- metadata:
+    name: worker-0
+  spec:
+    debug: false
+  status:
+    remoteEndpoints:
+    - status: connected  # or error, connecting
+      spec:
+        cluster_id: cluster2
+        health_check_ip: 10.130.1.2
+- metadata:
+    name: worker-1
+  # ...
+```
+
+### Status Values
+
+**connected:**
+- Health check ping to remote gateway succeeded
+- Full datapath (Segments 1+2) is working
+- This node can reach remote cluster
+
+**error:**
+- Health check ping to remote gateway failed
+- Either Segment 1 or Segment 2 is broken
+- Need to correlate with Gateway CR to determine which
+
+**connecting:**
+- Submariner still establishing connection
+- May indicate tunnel not ready yet
+
+**(empty/no status):**
+- Gateway nodes don't run health checks
+- Gateway CR is the authoritative source for gateway health
+
+### Correlation with Gateway CR
+
+**Pattern 1: Gateway=connected, RouteAgent=error**
 
 ```yaml
+# Gateway CR shows tunnel working
 status:
-  remoteEndpoints:
-  - status: connected  # or error, connecting
-    spec:
-      cluster_id: remote-cluster
+  connections:
+  - status: connected
+    endpoint:
+      cluster_id: cluster2
+
+# But RouteAgent on worker shows error
+# routeagents.yaml
+- metadata:
+    name: worker-0
+  status:
+    remoteEndpoints:
+    - status: error
 ```
 
-### Rules for Interpretation
+**Diagnosis:** Segment 1 failure (worker → gateway routing)
 
-- **Gateway nodes:** `status: none` = OK (expected - gateway doesn't check itself)
-- **Non-gateway nodes:** `status: connected` = OK (can route through gateway to remote)
-- **Non-gateway nodes:** `status != connected` = Problem (could be segment 1 or 2)
+**What Submariner configures for Segment 1:**
 
-## CRITICAL: Datapath Segmentation Logic
+**For Non-OVN CNIs (kindnet, Calico, etc.):**
+- VXLAN interface `vx-submariner` on worker
+- Route: `10.130.0.0/16 via 240.18.0.5 dev vx-submariner`
+- VTEP endpoint: Gateway node IP
 
-**Use Gateway + RouteAgent status together to determine which segment is failing:**
+**For OVN-Kubernetes:**
+- IP rules: `150: from all to 10.130.0.0/16 lookup 150`
+- Table 150: `default via <nexthop> dev ovn-k8s-mp0`
+- OVN router policies (multi-zone) or static routes (single-zone)
 
-### Pattern 1: Gateway "error" + RouteAgent "error"
+**Verification:**
+- Non-OVN: Check `vx-submariner` interface exists, routes present
+- OVN-K: Check IP rules, table 150, ovn-k8s-mp0 interface (see [ovn-offline-verification.md](ovn-offline-verification.md))
 
-```text
-Gateway health check: error (LocalGW → RemoteGW fails)
-RouteAgent health check: error (WorkerNode → LocalGW → RemoteGW fails)
+**Pattern 2: Gateway=error, RouteAgent=error**
+
+```yaml
+# Gateway CR shows tunnel broken
+status:
+  connections:
+  - status: error
+    statusMessage: "connecting to 172.18.0.5..."
+
+# RouteAgent also shows error
+- metadata:
+    name: worker-0
+  status:
+    remoteEndpoints:
+    - status: error
 ```
 
-**Analysis:**
-→ **Segment 2 (tunnel) is broken**  
-→ Focus on gateway-to-gateway issue FIRST  
-→ RouteAgent errors are downstream effect of tunnel failure  
-→ Don't investigate local routing until tunnel is fixed
+**Diagnosis:** Segment 2 failure (gateway → remote gateway tunnel)
 
-**Next steps:**
+**Investigation focus:**
+- IPsec tunnel status (see [tunnel-analysis.md](tunnel-analysis.md))
+- Firewall blocking (see [firewall-analysis.md](firewall-analysis.md))
+- Cable driver issues (libreswan, wireguard, vxlan)
 
-- Focus on tunnel analysis (see [tunnel-analysis.md](tunnel-analysis.md))
-- Check tcpdump data for infrastructure blocking
-- Verify firewall inter-cluster test results
+**Do NOT investigate local routing** until tunnel is fixed.
 
-### Pattern 2: Gateway "error" + RouteAgent "connected"
+**Pattern 3: Gateway=connected, RouteAgent=connected**
 
-```text
-Gateway health check: error (LocalGW → RemoteGW reports failure)
-RouteAgent health check: connected (WorkerNode → LocalGW → RemoteGW succeeds!)
+```yaml
+# Both show connected
+status:
+  connections:
+  - status: connected
+
+# routeagents.yaml
+- metadata:
+    name: worker-0
+  status:
+    remoteEndpoints:
+    - status: connected
 ```
 
-**Analysis:**
-→ **Tunnel datapath is actually working** (RouteAgent proves it)  
-→ Gateway health check failure is misleading  
-→ Most likely: Gateway health check IP configuration issue  
-→ Could also be: Gateway-specific routing problem (host network vs pod network)
+**Diagnosis:** Datapath fully healthy
 
-**Next steps:**
+**Action:** STOP - no further investigation needed
 
-- Verify health check IPs are correctly configured
-- Check if health check IP exists on gateway node (ip-a.log)
-- Investigate why gateway pod health check fails despite datapath working
-- Check gateway pod logs for health check errors
+## CNI-Specific Datapath Components
 
-**Important:** This pattern indicates the tunnel IS functional! Don't waste time on infrastructure blocking investigation.
+### Non-OVN CNI (kindnet, Calico, Cilium, etc.)
 
-### Pattern 3: Gateway "connected" + RouteAgent "error"
+**What RouteAgent configures:**
 
-```text
-Gateway health check: connected (LocalGW → RemoteGW works)
-RouteAgent health check: error (WorkerNode → LocalGW → RemoteGW fails)
-```
-
-**Analysis:**
-→ **Segment 1 (local routing) is broken**  
-→ Tunnel works, but worker nodes can't route to local gateway  
-→ This appears to be a local routing issue (pending further validation with logs)
-
-**Next steps:**
-
-- Check routing table on worker nodes (ip-routes-table150.log)
-- Verify routes to remote cluster CIDRs exist on worker nodes
-- Check RouteAgent pod logs on failing nodes
-- If OVN-K: Check OVN routing configuration
-
-### Pattern 4: Both "connected"
-
-```text
-Gateway health check: connected
-RouteAgent health check: connected
-```
-
-**Analysis:**
-→ **Datapath is healthy**  
-→ If connectivity issues exist, they're NOT in the Submariner datapath  
-→ Look elsewhere (application-level, service discovery, etc.)
-
-## OVN-Kubernetes Specific Checks
-
-**Only applicable if CNI = OVNKubernetes**
-
-### When to Check OVN Configuration
-
-- Any tunnel connectivity failure with "Failed to successfully ping" errors
-- Gateway pod showing "write ip 0.0.0.0" in logs
-- OVN-Kubernetes CNI environments
-- Non-gateway nodes succeed but gateway node fails
-
-### API Server Health Check
-
-File: `cluster*/gather/cluster*/<gateway-pod>-submariner-gateway.log`
-
-Look for rate limiter errors:
-
-```text
-rate limiter Wait returned an error: rate: Wait(n=1) would exceed context deadline
-```
-
-**Analysis:**
-
-- Count occurrences across the entire log file
-- Example: 124 errors over 3 weeks could indicate API server instability
-- **Possible Impact:** May contribute to resource sync issues, OVN controller stuck, routes not syncing
-- **Note:** Unlikely to be direct root cause of "write ip 0.0.0.0" errors, but could contribute to instability
-
-**Recommendation if found:**
-
-```text
-Consider checking API server health:
-- oc adm top nodes (check control plane CPU/memory)
-- Review API server logs for throttling/performance issues
-- Verify etcd health is normal
-- Check control plane resource utilization
-```
-
-### IP Rule Consistency Check
-
-**CRITICAL:** Check for IP rule differences, especially `fwmark 0x3f0`
-
-File: `cluster*/gather/cluster*/<nodename>_ip-rules.log`
-
-Look for this rule:
-
-```text
-5999: from all fwmark 0x3f0 lookup main
-```
-
-#### Analysis Patterns
-
-**Pattern 1: Cluster Asymmetry (LIKELY ISSUE)**
-
-```text
-cluster1: All nodes have "5999: from all fwmark 0x3f0 lookup main"
-cluster2: NO nodes have this rule
-```
-
-→ This **appears to be** a likely root cause of connectivity failure
-
-**Possible interaction with Gateway pod:**
-
-This asymmetry suggests a possible routing interaction. To verify:
-
-- Check if Gateway pod traffic carries `pkt_mark=1008` (0x3f0 in hex) in OVN logs
-- Verify IP rule 5999 exists: `ip rule show`
-- Confirm main routing table lacks routes to remote cluster CIDRs: `ip route show table main`
-- Review gateway pod logs for sendmsg() permission errors
-
-**If the interaction is confirmed:**
-
-This likely requires investigation at the OVN-Kubernetes or infrastructure level. Consider:
-
-- Reviewing OVN packet marking policies
-- Checking if IP rule configuration is expected for the OVN-K version in use
-- Consulting with networking team about IP rule asymmetry
-- Checking OVN-Kubernetes documentation for known issues
-
-**Why non-GW nodes might not be affected:**
-
-Non-GW RouteAgent traffic may remain in OVN overlay routing and not match the packet marking criteria,
-allowing table 150 routes to work normally.
-
-**Pattern 2: Both Clusters Have It (OK)**
-
-```text
-cluster1: Has fwmark 0x3f0 rule
-cluster2: Has fwmark 0x3f0 rule
-```
-
-→ Consistent configuration (issue is elsewhere)
-
-**Pattern 3: Neither Has It (OK)**
-
-```text
-cluster1: No fwmark 0x3f0 rule
-cluster2: No fwmark 0x3f0 rule
-```
-
-→ Consistent configuration (issue is elsewhere)
-
-#### Verification Steps
-
-1. Check ALL nodes in both clusters (rule should be present on all or none)
-2. Look for OVN packet marking in `<nodename>_ovn_lr_ovn_cluster_router_policies.log`:
-
-   ```text
-   pkt_mark=1008
+**On all nodes:**
+1. VXLAN interface
+   ```bash
+   # ip link show vx-submariner
+   vx-submariner: mtu 1400 qdisc noqueue state UNKNOWN
+       link/ether ... brd ff:ff:ff:ff:ff:ff
    ```
 
-3. Verify main routing table has NO routes to remote clusters:
+2. Routes for remote clusters
+   ```bash
+   # ip route show
+   10.130.0.0/16 via 240.18.0.5 dev vx-submariner onlink
+   172.30.0.0/16 via 240.18.0.5 dev vx-submariner onlink
+   ```
+
+3. VTEP entries (remote node IPs)
+   ```bash
+   # bridge fdb show dev vx-submariner
+   00:00:00:00:00:00 dst 172.18.0.5 self permanent  # Gateway node
+   00:00:00:00:00:00 dst 172.18.0.6 self permanent  # Worker nodes
+   ```
+
+**Verification:**
+- Interface exists: `ip link show vx-submariner`
+- Routes present: `ip route show | grep vx-submariner`
+- VTEP entries: `bridge fdb show dev vx-submariner`
+
+### OVN-Kubernetes CNI
+
+**What RouteAgent configures:**
+
+**On all nodes (gateway and non-gateway):**
+
+1. **IP Rules** - Direct traffic to routing tables
 
    ```bash
-   grep -E "<remote-cidr-1>|<remote-cidr-2>" <nodename>_ip-routes.log
+   # ip rule show | grep 150
+   150: from all to 10.130.0.0/16 lookup 150  # Remote pod CIDR
+   150: from all to 172.31.0.0/16 lookup 150  # Remote service CIDR
+   150: from all to 242.254.0.0/16 lookup 150 # Remote globalnet (if enabled)
+   
+   # ip rule show | grep 149
+   149: from all to 10.131.0.0/16 lookup 149  # Local pod CIDR (ingress)
    ```
 
-#### Possible Root Cause
+2. **Routing Tables**
 
-- Rule appears to be added by OVN-Kubernetes (possibly version-specific)
-- Could be related to AdminNetworkPolicy or NetworkPolicy features
-- Consider checking OVN-K version differences between clusters
+   ```bash
+   # ip route show table 150
+   default via 10.129.2.1 dev ovn-k8s-mp0
+   
+   # ip route show table 149
+   default via 10.129.2.1 dev ovn-k8s-mp0
+   ```
 
-### OVN Logical Router Configuration
+3. **ovn-k8s-mp0 Interface**
 
-#### Step 1: Check OVN Logical_Router_Static_Route
+   ```bash
+   # ip addr show ovn-k8s-mp0
+   ovn-k8s-mp0: <BROADCAST,MULTICAST,UP> mtu 1400
+       inet 10.129.2.2/23 scope global ovn-k8s-mp0
+   ```
 
-File: `cluster*/gather/cluster*/<nodename>_ovn_lr_ovn_cluster_router_routes.log`
+**On gateway node only:**
 
-Expected:
+1. **OVN Logical Router Policies**
 
-```text
-IPv4 Routes
-Route Table <main>:
-            172.32.0.0/16                172.28.4.2 dst-ip
-            172.34.0.0/16                172.28.4.2 dst-ip
+   ```bash
+   # ovn-nbctl lr-policy-list ovn_cluster_router
+   20000  ip4.dst==10.130.0.0/16  reroute  10.1.1.2
+   ```
+
+2. **OVN Static Routes**
+
+   ```bash
+   # ovn-nbctl lr-route-list ovn_cluster_router
+   10.130.0.0/16  10.1.1.2
+   ```
+
+**Multi-zone topology differences:**
+- Non-gateway nexthop: Transit switch IP (169.254.0.1 or 100.88.0.x)
+- Gateway nexthop: ovn-k8s-mp0 IP (10.1.1.2)
+
+**Verification:**
+- See: [ovn-offline-verification.md](ovn-offline-verification.md) for complete checklist
+
+## Common Issues and Patterns
+
+### Issue 1: VXLAN Interface Missing (Non-OVN)
+
+**Symptoms:**
+- Gateway=connected, RouteAgent=error
+- `ip link show vx-submariner` returns nothing
+
+**What should be there:**
+- RouteAgent creates `vx-submariner` interface on all nodes
+- VXLAN ID: 100, UDP port: 4800
+
+**Investigation:**
+- Check RouteAgent logs for interface creation errors
+- Verify node has VXLAN kernel module loaded
+
+**Escalate if:**
+- RouteAgent logs show no errors but interface still missing
+
+### Issue 2: Table 150 Route Missing (OVN-K)
+
+**Symptoms:**
+- Gateway=connected, RouteAgent=error
+- `ip route show table 150` is empty or missing ovn-k8s-mp0 route
+
+**What should be there:**
+```bash
+default via <nexthop> dev ovn-k8s-mp0 table 150
 ```
 
-- Routes to remote cluster CIDRs should exist
-- Nexthop should be local health check IP (e.g., 172.28.4.2 on ovn-k8s-mp0)
-- Get remote CIDRs from Gateway CR `status.gateways[].connections[].endpoint.subnets[]`
+**Investigation:**
+- Check if ovn-k8s-mp0 interface exists
+- Check RouteAgent logs for: `"error monitoring routing table for interface"`
 
-#### Step 2: Check OVN Logical_Router_Policy
+**Escalate if:**
+- ovn-k8s-mp0 exists and is UP
+- IP rules are present
+- But table 150 route still missing (likely OVN-K platform issue)
 
-File: `cluster*/gather/cluster*/<nodename>_ovn_lr_ovn_cluster_router_policies.log`
+### Issue 3: OVN Policies Missing (OVN-K)
 
-Expected:
+**Symptoms:**
+- Gateway=connected, RouteAgent=error
+- `ovn-nbctl lr-policy-list` shows no reroute policies for remote CIDRs
 
-```text
-Routing Policies
-     20000                           ip4.dst == 172.32.0.0/16         reroute
-     20000                           ip4.dst == 172.34.0.0/16         reroute
-       102 ... && ip4.dst == ...     allow               pkt_mark=1008
-```
+**What should be there:**
+- Router policies with priority 20000
+- Action: reroute to ovn-k8s-mp0 IP or transit switch IP
 
-- Priority 20000 policies for remote cluster CIDRs (reroute action)
-- Priority 102 policies may mark certain traffic with pkt_mark=1008
+**Investigation:**
+- Check if GatewayRoute/NonGatewayRoute CRs exist
+- Check gateway RouteAgent logs for OVN configuration errors
 
-**IMPORTANT:** If `pkt_mark=1008` is found AND `fwmark 0x3f0` IP rule exists:
-→ This combination **appears to be** the likely cause of Gateway pod ping failure!
+**Escalate if:**
+- CRs exist but OVN policies missing
+- RouteAgent logs show no errors
 
-#### Step 3: Verify Main Routing Table
+## Analysis Workflow
 
-File: `cluster*/gather/cluster*/<gateway-node>_ip-routes.log`
-
-Check that main table does NOT have remote cluster routes:
+### Step 1: Get Gateway and RouteAgent Status
 
 ```bash
-grep "<remote-cidr>" <gateway-node>_ip-routes.log
+# Gateway CR status
+grep -A5 "status:" cluster1/gather/cluster1/gateway.yaml
+
+# RouteAgent status for each node
+grep -B2 -A5 "status:" cluster1/routeagents.yaml
 ```
 
-Expected:
+### Step 2: Determine Faulty Segment
 
-- Main table should NOT have routes to remote clusters
-- Submariner uses table 150 for remote cluster routing
-- If main table HAS these routes → unusual configuration
+Use decision matrix above.
 
-#### Step 4: Check Table 150 (OVN Local Gateway Mode)
+### Step 3: Focus Investigation
 
-File: `cluster*/gather/cluster*/<gateway-node>_ip-routes-table150.log`
+**If Segment 1 (local routing):**
 
-Expected for OVN local gateway mode:
+- Non-OVN: Check VXLAN interface and routes
+- OVN-K: Check IP rules, table 150, OVN policies (see [ovn-offline-verification.md](ovn-offline-verification.md))
 
-```text
-default via 172.28.4.1 dev ovn-k8s-mp0
-```
+**If Segment 2 (tunnel):**
 
-NOT expected (but would work):
+- See: [tunnel-analysis.md](tunnel-analysis.md)
+- See: [firewall-analysis.md](firewall-analysis.md)
 
-```text
-172.32.0.0/16 via 172.28.4.2 dev ovn-k8s-mp0
-172.34.0.0/16 via 172.28.4.2 dev ovn-k8s-mp0
-```
+### Step 4: Verify Configuration
 
-**Analysis:**
+**For Non-OVN:**
+1. VXLAN interface exists
+2. Routes present
+3. VTEP entries present
 
-- OVN local gateway mode uses OVN Logical_Router_Static_Route, NOT Linux table 150 routes
-- Both gateway nodes (working and broken) have identical table 150: just default route
-- Actual routing happens at OVN level, not Linux routing table level
+**For OVN-K:**
+1. IP rules present (all nodes)
+2. Table 150/149 routes present (all nodes)
+3. ovn-k8s-mp0 interface UP (all nodes)
+4. OVN policies present (gateway only)
 
-## Important Notes
+### Step 5: Escalate if Needed
 
-- RouteAgent logs should be checked for configuration errors
-- If no errors exist, trust Submariner components
-- Don't recommend manual iptables/nftables investigation unless logs indicate problems
-- For OVN-K environments, check both Linux-level and OVN-level configuration
+**If all configuration is correct but connectivity fails:**
+
+- Provide evidence (file contents, status outputs)
+- Contact Submariner community:
+  - [Slack](https://kubernetes.slack.com/archives/C010RJV694M)
+  - [GitHub Issues](https://github.com/submariner-io/submariner/issues)
+
+**Do NOT:**
+- Deep-dive into CNI platform internals
+- Manually modify VXLAN, OVN, or routing configuration
+- Troubleshoot underlying CNI issues
+
+## Summary
+
+**RouteAgent CR tells you:**
+- Whether full datapath works (Segments 1+2)
+- Which nodes can reach remote clusters
+
+**Gateway CR tells you:**
+- Whether tunnel works (Segment 2 only)
+
+**Together they tell you:**
+- Which segment is broken
+- Where to focus investigation
+
+**Early exit:**
+- Both connected → STOP, datapath healthy
+- Gateway connected + RouteAgent error → Focus on local routing ONLY
+- Gateway error → Fix tunnel first

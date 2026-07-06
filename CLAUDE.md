@@ -22,13 +22,14 @@ When analyzing diagnostics, the process follows:
 
 Analysis knowledge is modular and located in `docs/analysis/`:
 
-- `datapath-architecture.md` - **Datapath fundamentals** (for understanding flow, NOT for manual fixes in reports)
+- `datapath-architecture.md` - **Datapath fundamentals** including OVN-K architecture and all 4 traffic scenarios
 - `tunnel-analysis.md` - Tunnel connectivity and IPsec datapath issues
 - `asymmetric-tunnel-analysis.md` - Asymmetric tunnel status investigation
 - `firewall-analysis.md` - Network/firewall blocking detection (tcpdump analysis)
 - `mtu-analysis.md` - MTU and fragmentation issues
 - `gateway-ha-analysis.md` - Gateway HA status and multiple active pods
 - `routeagent-analysis.md` - RouteAgent health and OVN-specific checks
+- `ovn-offline-verification.md` - **OVN-K offline verification** (IP rules, table 150, OVN policies, CR validation)
 - `deployment-detection.md` - ACM vs Standalone deployment detection
 - `report-format.md` - Analysis report templates (brief and detailed)
 - `special-cases.md` - Special scenarios (OpenShift on OpenStack UDP ports, context name conflicts)
@@ -66,7 +67,34 @@ Analysis knowledge is modular and located in `docs/analysis/`:
 - Only use `subctl show/diagnose/verify` for VERIFICATION after fixes
 - NEVER recommend `subctl deploy-broker` or `subctl join`
 
-### 6. Check for Asymmetric Tunnel Status FIRST
+### 6. Check Datapath Segmentation FIRST
+
+**CRITICAL:** Before deep investigation, determine which datapath segment is failing:
+
+```
+Full path: Non-GW → Local-GW → Remote-GW
+
+Segment 1 (Local routing): Non-GW → Local-GW
+Segment 2 (Inter-cluster): Local-GW → Remote-GW
+```
+
+**Decision Matrix:**
+- Gateway CR status = Segment 2 health (inter-cluster tunnel)
+- RouteAgent CR status = Full path health (both segments)
+
+**Early Exit:**
+- If Gateway=connected AND RouteAgent=connected → Datapath is healthy, stop investigation
+- If Gateway=connected AND RouteAgent=error → Focus ONLY on local routing (Segment 1)
+- If Gateway=error AND RouteAgent=connected → Investigate why GW health check fails despite full path working
+  (unusual case - see special cases below)
+- If Gateway=error AND RouteAgent=error → Focus on inter-cluster tunnel (Segment 2) FIRST
+
+**For OVN-K CNI:** When local routing issue detected (Gateway connected + RouteAgent error):
+- Verify Submariner OVN-K configuration per `ovn-offline-verification.md`
+- If all config correct, use cautious language: "appears to be infrastructure/OVN-K platform issue"
+- Recommend contacting Submariner community, NOT vendor support
+
+### 7. Check for Asymmetric Tunnel Status
 
 - Before concluding infrastructure/firewall blocking, check if tunnel status is asymmetric
 - Asymmetric = one cluster shows "connected", the other shows different status

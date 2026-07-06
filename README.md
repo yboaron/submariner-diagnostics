@@ -111,9 +111,60 @@ When `--sanitize` is used:
 
 ### 2. Analyze (Basic - No AI)
 
+#### Quick Analysis (for Engineers)
+
+**Option 1: No Clone Required (Easiest)**
+
+Analyze diagnostics with a single command - no need to clone the repository:
+
+**Prerequisites:** `python3` with `pyyaml` installed (`pip install pyyaml`)
+
+```bash
+# Interactive - prompts for file path
+curl -sL https://raw.githubusercontent.com/submariner-io/submariner-diagnostics/devel/bin/analyze-remote.sh | bash
+
+# Or provide file path directly (non-interactive)
+curl -sL https://raw.githubusercontent.com/submariner-io/submariner-diagnostics/devel/bin/analyze-remote.sh | bash -s ~/path/to/diagnostics.tar.gz
+```
+
+**What it does:**
+1. Downloads the analyzer script (no repo clone)
+2. Prompts you for the diagnostics file path
+3. Runs analysis and shows clean Slack-friendly output
+4. Cleans up temporary files automatically
+
+**Option 2: After Cloning**
+
+For fast analysis with clean output suitable for Slack:
+
+```bash
+# Auto-detects latest file in ~/Downloads/
+./bin/quick-analyze.sh
+
+# Or specify file
+./bin/quick-analyze.sh ~/Downloads/submariner-diagnostics-TIMESTAMP.tar.gz
+```
+
+Both options:
+- Auto-detect the latest diagnostics file (no need to type long filenames)
+- Output clean, condensed format perfect for copying to Slack
+- No ANSI colors (clean paste)
+- Show top 5 issues and top 3 recommendations
+
+#### Full Analysis
+
+For detailed terminal output with colors:
+
 ```bash
 ./analyze-basic.py submariner-diagnostics-TIMESTAMP.tar.gz
+
+# Or for Slack-friendly output (clean, condensed, no colors)
+./analyze-basic.py submariner-diagnostics-TIMESTAMP.tar.gz --format slack
 ```
+
+**Output formats:**
+- `--format terminal` (default): Colored, verbose output for terminal viewing
+- `--format slack`: Clean, condensed output for copy-paste to Slack/chat
 
 #### What it detects
 

@@ -38,7 +38,66 @@ status:
   networkPlugin: OVNKubernetes  # or Calico, etc.
 ```
 
-### Step 2: If CNI is OVN-Kubernetes
+### Step 2: Check RouteAgent Status Pattern (CRITICAL)
+
+**Before investigating CNI-specific issues**, check if the error cluster shows a **mixed RouteAgent pattern**.
+
+This is a key diagnostic clue that rules out infrastructure/firewall blocking.
+
+#### Read RouteAgent Status on Error Cluster
+
+```bash
+# If cluster2 shows "error" status
+grep -A10 "status:" cluster2/routeagents.yaml
+```
+
+**Look for the pattern:**
+- SOME workers show `status: connected` (can ping remote healthCheckIP)
+- SOME workers show `status: error` (cannot ping remote healthCheckIP)
+- Gateway node shows `status: none` (expected - gateways don't ping themselves)
+
+**Example mixed pattern:**
+```yaml
+# Worker 1
+status: error
+statusMessage: "Failed to successfully ping the remote endpoint IP 172.32.4.2"
+
+# Worker 2
+status: connected
+latencyRTT: 4.45ms
+
+# Worker 3
+status: connected
+latencyRTT: 4.40ms
+
+# Gateway node
+status: none
+statusMessage: "Health check is not performed on gateway nodes"
+```
+
+#### Interpretation
+
+**If mixed pattern detected:**
+- ✅ This **rules OUT** infrastructure/firewall blocking
+  - If firewall was blocking, ALL workers would fail
+  - SOME workers succeeding proves tunnel datapath is reachable
+  
+- ✅ This **confirms** node-specific routing/SNAT issue
+  - Gateway node or specific workers have routing misconfiguration
+  - NOT a cross-cluster infrastructure problem
+  
+**Diagnosis:** Node-specific routing/SNAT issue (NOT infrastructure blocking)
+
+**Next steps:**
+- Compare routing tables on working vs failing worker nodes
+- Check for SNAT configuration differences
+- Verify OVN-K routing policies (if applicable)
+
+**Skip infrastructure firewall investigation** - the mixed pattern proves connectivity is possible.
+
+---
+
+### Step 3: If CNI is OVN-Kubernetes
 
 This configuration **might be affected by** a known issue with OVN-Kubernetes in local gateway mode.
 
@@ -112,7 +171,7 @@ may interfere with Submariner health check traffic.
 - Consider potential side effects
 - Alternative: Switch to shared gateway mode (requires cluster reconfiguration)
 
-### Step 3: If CNI is NOT OVN-Kubernetes
+### Step 4: If CNI is NOT OVN-Kubernetes
 
 This could be a routing configuration issue on the gateway node showing "error" status.
 

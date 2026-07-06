@@ -108,11 +108,16 @@ Read `cluster1/acm-addons.txt` and `cluster1/submarinerconfig.yaml`:
      - Gateway checks: LocalGW → RemoteGW (tunnel segment only)
      - RouteAgent checks: WorkerNode → LocalGW → RemoteGW (full path including local routing)
 
-   **Interpretation:**
-   - **Gateway "error" + RouteAgent "error"** → Focus on GW-to-GW tunnel segment FIRST
-   - **Gateway "error" + RouteAgent "connected"** → Investigate why GW health check fails despite RouteAgent success
-   - **Gateway "connected" + RouteAgent "error"** → Focus on local routing (WorkerNode → LocalGW)
-   - **Both "connected"** → Datapath is healthy, issue elsewhere
+   **Interpretation (CHECK THIS FIRST!):**
+   - **Gateway "connected" + RouteAgent "connected"** → ✅ **STOP** - Datapath fully healthy, no investigation needed
+   - **Gateway "connected" + RouteAgent "error"** → 🔍 Investigate **LOCAL ROUTING** only (Non-GW → GW)
+   - **Gateway "error" + RouteAgent "connected"** → 🔍 Investigate why GW health check fails despite RouteAgent success
+   - **Gateway "error" + RouteAgent "error"** → 🔍 Investigate **INTER-CLUSTER TUNNEL** first (GW → GW)
+
+   **Early Exit Rule:**
+   - If BOTH Gateway CR shows "connected" AND all non-gateway RouteAgents show "connected"
+   - Then datapath is fully healthy - issue is NOT in routing/tunnel layer
+   - Report: Submariner L3 connectivity appears healthy, skip datapath investigation
 
 3. **Endpoint Consistency** - Both clusters should see same Endpoint resources
 

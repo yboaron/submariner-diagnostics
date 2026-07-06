@@ -96,6 +96,80 @@ sanitize_context_name() {
     echo "$context" | sed 's/[:/\\@]/-/g'
 }
 
+# Function to merge kubeconfigs while handling duplicate user names
+# kubectl config view --flatten deduplicates users by name, which causes credential loss
+# when both kubeconfigs use the same user name (e.g., "admin")
+merge_kubeconfigs_safely() {
+    local kubeconfig1="$1"
+    local kubeconfig2="$2"
+    local output_file="$3"
+    local context1="$4"
+    local context2="$5"
+
+    # Check if kubeconfigs are the same file
+    if [ "$kubeconfig1" = "$kubeconfig2" ]; then
+        # Same file, no deduplication risk
+        KUBECONFIG="${kubeconfig1}" kubectl config view --flatten > "${output_file}"
+        return 0
+    fi
+
+    # Extract contexts and their associated users
+    local context1_user=$(KUBECONFIG="${kubeconfig1}" kubectl config view -o jsonpath="{.contexts[?(@.name==\"${context1}\")].context.user}" 2>/dev/null)
+    local context2_user=$(KUBECONFIG="${kubeconfig2}" kubectl config view -o jsonpath="{.contexts[?(@.name==\"${context2}\")].context.user}" 2>/dev/null)
+
+    # Check if both contexts use the same user name
+    if [ "$context1_user" = "$context2_user" ] && [ -n "$context1_user" ]; then
+        echo "  ⚠ Warning: Both kubeconfigs use the same user name: '${context1_user}'"
+        echo "     Renaming user in cluster2 context to prevent credential loss..."
+
+        # Create temp copy of kubeconfig2 with renamed user
+        local temp_kc2="${output_file}.tmp2"
+        cp "${kubeconfig2}" "${temp_kc2}"
+
+        # Rename user in kubeconfig2
+        local new_user="${context2_user}-${context2}"
+
+        # Get the user credentials
+        KUBECONFIG="${kubeconfig2}" kubectl config view --raw -o json > "${temp_kc2}.json"
+
+        # Use Python/jq to rename the user (more reliable than kubectl config commands)
+        python3 -c "
+import json, sys
+with open('${temp_kc2}.json') as f:
+    config = json.load(f)
+
+# Find and rename the user
+for user in config.get('users', []):
+    if user['name'] == '${context2_user}':
+        user['name'] = '${new_user}'
+
+# Update context to reference new user name
+for ctx in config.get('contexts', []):
+    if ctx['name'] == '${context2}' and ctx['context']['user'] == '${context2_user}':
+        ctx['context']['user'] = '${new_user}'
+
+with open('${temp_kc2}', 'w') as f:
+    json.dump(config, f, indent=2)
+" 2>/dev/null || {
+            # Fallback if Python fails: use sed
+            sed "s/\"name\": \"${context2_user}\"/\"name\": \"${new_user}\"/" "${temp_kc2}.json" > "${temp_kc2}"
+        }
+
+        rm -f "${temp_kc2}.json"
+
+        # Now merge with renamed user
+        KUBECONFIG="${kubeconfig1}:${temp_kc2}" kubectl config view --flatten > "${output_file}"
+        rm -f "${temp_kc2}"
+
+        echo "     ✓ User renamed to '${new_user}' in merged config"
+    else
+        # No duplicate user names, safe to merge directly
+        KUBECONFIG="${kubeconfig1}:${kubeconfig2}" kubectl config view --flatten > "${output_file}"
+    fi
+
+    return 0
+}
+
 # Function to sanitize all collected files using Python script
 sanitize_diagnostics() {
     local sanitize_script="$(dirname "$0")/sanitize-diagnostics.py"
@@ -496,6 +570,284 @@ EOF
     echo "  ✓ Cleanup complete"
 }
 
+# Function to collect OVN-K pinger diagnostics tcpdump
+# Collects multi-checkpoint packet captures for OVN-Kubernetes host networking routing issues
+# Uses DaemonSet approach (like firewall tcpdump) since RouteAgent/Gateway pods don't have tcpdump
+collect_ovnk_pinger_tcpdump() {
+    local cluster_name="$1"
+    local kubeconfig="$2"
+    local context="$3"
+    local output_dir="$4"
+    local health_check_ip="$5"
+
+    echo "  Collecting OVN-K pinger diagnostics from ${cluster_name}..."
+
+    # Get active gateway node
+    local gateway_node=$(kubectl get submariner submariner -n submariner-operator \
+        --kubeconfig="${kubeconfig}" --context="${context}" \
+        -o jsonpath='{.status.gateways[?(@.haStatus=="active")].localEndpoint.hostname}' 2>/dev/null)
+
+    if [ -z "$gateway_node" ]; then
+        echo "    ⚠ No active gateway found, skipping ${cluster_name}"
+        return
+    fi
+
+    # Get a worker node (preferably one with RouteAgent error)
+    local worker_node=$(kubectl get routeagents -n submariner-operator \
+        --kubeconfig="${kubeconfig}" --context="${context}" \
+        -o jsonpath='{.items[?(@.status.remoteEndpoints[0].status=="error")].metadata.name}' 2>/dev/null | head -1 | awk '{print $1}')
+
+    if [ -z "$worker_node" ]; then
+        echo "    → No worker with RouteAgent error found, using any non-gateway worker"
+        worker_node=$(kubectl get nodes --kubeconfig="${kubeconfig}" --context="${context}" \
+            --selector='!node-role.kubernetes.io/master,!node-role.kubernetes.io/control-plane,submariner.io/gateway!=true' \
+            -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+    fi
+
+    if [ -z "$worker_node" ]; then
+        echo "    ⚠ No worker node found, skipping ${cluster_name}"
+        return
+    fi
+
+    echo "    → Gateway node: ${gateway_node}"
+    echo "    → Worker node: ${worker_node}"
+
+    # Deploy DaemonSet for tcpdump collection
+    echo "    Deploying OVN-K pinger tcpdump DaemonSet..."
+    cat <<EOF | kubectl apply --kubeconfig="${kubeconfig}" --context="${context}" -f -
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: submariner-ovnk-pinger-tcpdump
+  namespace: submariner-operator
+spec:
+  selector:
+    matchLabels:
+      app: submariner-ovnk-pinger-tcpdump
+  template:
+    metadata:
+      labels:
+        app: submariner-ovnk-pinger-tcpdump
+    spec:
+      tolerations:
+      - operator: Exists
+      containers:
+      - name: tcpdump
+        image: quay.io/submariner/nettest:devel
+        imagePullPolicy: IfNotPresent
+        command:
+        - /bin/sh
+        - -c
+        - |
+          NODE_NAME=\$(hostname)
+
+          # Gateway node: 30s capture, 2 checkpoints
+          if [ "\${NODE_NAME}" = "${gateway_node}" ]; then
+            echo "Gateway node tcpdump starting (30s - 2 checkpoints)..."
+            timeout 30 tcpdump -i ovn-k8s-mp0 -n "icmp and host ${health_check_ip}" -c 50 -w /tmp/gw-ovnk8smp0.pcap 2>&1 &
+            timeout 30 tcpdump -i any -n "icmp and host ${health_check_ip}" -c 100 -w /tmp/gw-any.pcap 2>&1 &
+          fi
+
+          # Worker node: 90s capture, 2 checkpoints (RouteAgent pings every 60s)
+          if [ "\${NODE_NAME}" = "${worker_node}" ]; then
+            echo "Worker node tcpdump starting (90s - 2 checkpoints, pings every 60s)..."
+            timeout 90 tcpdump -i ovn-k8s-mp0 -n "icmp and host ${health_check_ip}" -c 20 -w /tmp/worker-ovnk8smp0.pcap 2>&1 &
+            timeout 90 tcpdump -i any -n "icmp and host ${health_check_ip}" -c 30 -w /tmp/worker-any.pcap 2>&1 &
+          fi
+
+          # Wait for captures + margin for file extraction
+          sleep 120
+        securityContext:
+          privileged: true
+          capabilities:
+            add:
+            - NET_ADMIN
+            - NET_RAW
+        volumeMounts:
+        - name: host-tmp
+          mountPath: /tmp
+      volumes:
+      - name: host-tmp
+        emptyDir: {}
+      restartPolicy: Always
+      hostNetwork: true
+      serviceAccount: submariner-routeagent
+      serviceAccountName: submariner-routeagent
+EOF
+
+    if [ $? -ne 0 ]; then
+        echo "    ✗ Failed to deploy OVN-K pinger tcpdump DaemonSet on ${cluster_name}"
+        kubectl delete daemonset submariner-ovnk-pinger-tcpdump -n submariner-operator \
+            --kubeconfig="${kubeconfig}" --context="${context}" >/dev/null 2>&1
+        return
+    fi
+
+    echo "    ✓ DaemonSet deployed, waiting for pods..."
+    sleep 5
+
+    # Wait for pods to be ready
+    kubectl wait --for=condition=Ready pod -l app=submariner-ovnk-pinger-tcpdump -n submariner-operator \
+        --kubeconfig="${kubeconfig}" --context="${context}" --timeout=30s >/dev/null 2>&1 || \
+        echo "    ⚠ Warning: Pods did not become ready within 30s, will attempt to continue..."
+
+    # Wait for tcpdump to complete (90s worker + 30s margin)
+    echo "    Capturing traffic (120s total wait)..."
+    sleep 120
+
+    # Extract files from gateway pod
+    local gw_tcpdump_pod=$(kubectl get pods -n submariner-operator -l app=submariner-ovnk-pinger-tcpdump \
+        --kubeconfig="${kubeconfig}" --context="${context}" \
+        -o jsonpath="{.items[?(@.spec.nodeName==\"${gateway_node}\")].metadata.name}" 2>/dev/null)
+
+    if [ -n "$gw_tcpdump_pod" ]; then
+        echo "    Extracting gateway pcap files from pod: ${gw_tcpdump_pod}"
+        for checkpoint in ovnk8smp0 any; do
+            local pcap_file="${output_dir}/${cluster_name}-gateway-${gateway_node}-${checkpoint}.pcap"
+            local txt_file="${output_dir}/${cluster_name}-gateway-${gateway_node}-${checkpoint}-analysis.txt"
+
+            kubectl exec -n submariner-operator "${gw_tcpdump_pod}" --kubeconfig="${kubeconfig}" --context="${context}" -- \
+                cat /tmp/gw-${checkpoint}.pcap > "${pcap_file}" 2>/dev/null
+
+            if [ -f "${pcap_file}" ] && [ -s "${pcap_file}" ]; then
+                echo "      ✓ Collected: $(basename ${pcap_file})"
+                tcpdump -r "${pcap_file}" -n -v > "${txt_file}" 2>/dev/null && \
+                    echo "      ✓ Analysis: $(basename ${txt_file})"
+            fi
+        done
+    fi
+
+    # Extract files from worker pod
+    local worker_tcpdump_pod=$(kubectl get pods -n submariner-operator -l app=submariner-ovnk-pinger-tcpdump \
+        --kubeconfig="${kubeconfig}" --context="${context}" \
+        -o jsonpath="{.items[?(@.spec.nodeName==\"${worker_node}\")].metadata.name}" 2>/dev/null)
+
+    if [ -n "$worker_tcpdump_pod" ]; then
+        echo "    Extracting worker pcap files from pod: ${worker_tcpdump_pod}"
+        for checkpoint in ovnk8smp0 any; do
+            local pcap_file="${output_dir}/${cluster_name}-worker-${worker_node}-${checkpoint}.pcap"
+            local txt_file="${output_dir}/${cluster_name}-worker-${worker_node}-${checkpoint}-analysis.txt"
+
+            kubectl exec -n submariner-operator "${worker_tcpdump_pod}" --kubeconfig="${kubeconfig}" --context="${context}" -- \
+                cat /tmp/worker-${checkpoint}.pcap > "${pcap_file}" 2>/dev/null
+
+            if [ -f "${pcap_file}" ] && [ -s "${pcap_file}" ]; then
+                echo "      ✓ Collected: $(basename ${pcap_file})"
+                tcpdump -r "${pcap_file}" -n -v > "${txt_file}" 2>/dev/null && \
+                    echo "      ✓ Analysis: $(basename ${txt_file})"
+            fi
+        done
+    fi
+
+    # Cleanup DaemonSet
+    echo "    Cleaning up OVN-K pinger tcpdump DaemonSet..."
+    kubectl delete daemonset submariner-ovnk-pinger-tcpdump -n submariner-operator \
+        --kubeconfig="${kubeconfig}" --context="${context}" >/dev/null 2>&1
+}
+
+# Function to collect table 150 routes from all nodes for OVN-K
+collect_ovnk_table150_all_nodes() {
+    local cluster_name="$1"
+    local kubeconfig="$2"
+    local context="$3"
+    local gather_dir="$4"
+
+    echo "  Collecting table 150 routes from all nodes (${cluster_name})..."
+
+    # Get all RouteAgent pods
+    local routeagent_pods=$(kubectl --context "$context" get pods -n submariner-operator \
+        -l app=submariner-routeagent -o name --kubeconfig="${kubeconfig}" 2>/dev/null)
+
+    if [[ -z "$routeagent_pods" ]]; then
+        echo "    ⚠ No RouteAgent pods found"
+        return
+    fi
+
+    local collected_count=0
+
+    # For each RouteAgent pod
+    while IFS= read -r pod; do
+        local pod_name=$(basename "$pod")
+
+        # Get node name
+        local node_name=$(kubectl --context "$context" get "$pod" -n submariner-operator \
+            -o jsonpath='{.spec.nodeName}' --kubeconfig="${kubeconfig}" 2>/dev/null)
+
+        if [[ -z "$node_name" ]]; then
+            continue
+        fi
+
+        # Collect table 150 route (unconditionally - simple and consistent)
+        local output_file="${gather_dir}/${node_name}_ip-routes-table150.log"
+
+        {
+            echo "ip route show table 150"
+            kubectl --context "$context" exec -n submariner-operator "$pod" --kubeconfig="${kubeconfig}" -- \
+                ip route show table 150 2>&1
+        } > "$output_file" 2>&1
+
+        if [[ $? -eq 0 ]]; then
+            ((collected_count++))
+        else
+            echo "    ⚠ ${node_name}: Failed to collect"
+        fi
+    done <<< "$routeagent_pods"
+
+    echo "    ✓ Collected table 150 from ${collected_count} node(s)"
+}
+
+# Function to collect nftables rules from all nodes
+# Note: Submariner 0.22+ uses nftables by default, but we collect from all versions
+# If nftables is not available, collection will fail gracefully
+collect_nftables_all_nodes() {
+    local cluster_name="$1"
+    local kubeconfig="$2"
+    local context="$3"
+    local gather_dir="$4"
+
+    echo "  Collecting nftables rules from all nodes (${cluster_name})..."
+
+    # Get all RouteAgent pods
+    local routeagent_pods=$(kubectl --context "$context" get pods -n submariner-operator \
+        -l app=submariner-routeagent -o name --kubeconfig="${kubeconfig}" 2>/dev/null)
+
+    if [[ -z "$routeagent_pods" ]]; then
+        echo "    ⚠ No RouteAgent pods found"
+        return
+    fi
+
+    local collected_count=0
+
+    # For each RouteAgent pod
+    while IFS= read -r pod; do
+        local pod_name=$(basename "$pod")
+
+        # Get node name
+        local node_name=$(kubectl --context "$context" get "$pod" -n submariner-operator \
+            -o jsonpath='{.spec.nodeName}' --kubeconfig="${kubeconfig}" 2>/dev/null)
+
+        if [[ -z "$node_name" ]]; then
+            continue
+        fi
+
+        # Collect nftables ruleset
+        local output_file="${gather_dir}/${node_name}_nftables.log"
+
+        {
+            echo "nft list ruleset"
+            kubectl --context "$context" exec -n submariner-operator "$pod" --kubeconfig="${kubeconfig}" -- \
+                nft list ruleset 2>&1
+        } > "$output_file" 2>&1
+
+        if [[ $? -eq 0 ]]; then
+            ((collected_count++))
+        else
+            echo "    ⚠ ${node_name}: Failed to collect (nft might not be available)"
+        fi
+    done <<< "$routeagent_pods"
+
+    echo "    ✓ Collected nftables from ${collected_count} node(s)"
+}
+
 # Function to collect firewall inter-cluster diagnostics
 collect_firewall_inter_cluster() {
     local cluster1_name="$1"
@@ -510,7 +862,7 @@ collect_firewall_inter_cluster() {
 
     # Merge kubeconfigs temporarily for subctl diagnose firewall
     MERGED_KUBECONFIG_FW="${firewall_dir}/merged-kubeconfig-fw"
-    KUBECONFIG="${kubeconfig1}:${kubeconfig2}" kubectl config view --flatten > "${MERGED_KUBECONFIG_FW}"
+    merge_kubeconfigs_safely "${kubeconfig1}" "${kubeconfig2}" "${MERGED_KUBECONFIG_FW}" "${cluster1_name}" "${cluster2_name}"
 
     # Build command
     FIREWALL_CMD="KUBECONFIG=${MERGED_KUBECONFIG_FW} subctl diagnose firewall inter-cluster --context ${cluster1_name} --remotecontext ${cluster2_name} --verbose"
@@ -1175,6 +1527,10 @@ echo "Tunnel status:"
 echo "  Cluster1: ${TUNNEL_STATUS_CLUSTER1}"
 echo "  Cluster2: ${TUNNEL_STATUS_CLUSTER2}"
 
+# Detect CNI from subctl-show-all.txt (needed for OVN-K pinger diagnostics)
+CNI_CLUSTER1=$(grep "Network plugin:" "${OUTPUT_DIR}/cluster1/subctl-show-all.txt" 2>/dev/null | awk '{print $NF}' | tr -d '[:space:]')
+CNI_CLUSTER2=$(grep "Network plugin:" "${OUTPUT_DIR}/cluster2/subctl-show-all.txt" 2>/dev/null | awk '{print $NF}' | tr -d '[:space:]')
+
 # Collect tcpdump only if tunnel is NOT connected on either cluster
 if [ "$TUNNEL_STATUS_CLUSTER1" != "connected" ] || [ "$TUNNEL_STATUS_CLUSTER2" != "connected" ]; then
     echo ""
@@ -1224,6 +1580,122 @@ else
     echo "  ✓ Tunnel connected on both clusters - skipping tcpdump collection"
     echo ""  >> "${OUTPUT_DIR}/manifest.txt"
     echo "tcpdump Collection: Skipped (tunnel connected on both clusters)" >> "${OUTPUT_DIR}/manifest.txt"
+fi
+
+# OVN-K Pinger Diagnostics tcpdump collection
+# Collect targeted packet captures for OVN-Kubernetes pinger failures
+# Only runs when:
+#  1. CNI is OVN-Kubernetes
+#  2. Pinger failed (Gateway or RouteAgent status != connected)
+echo ""
+echo "=== Checking OVN-K pinger diagnostics requirements ==="
+
+# Check if either cluster is using OVN-K
+if [[ "$CNI_CLUSTER1" == "OVNKubernetes" ]] || [[ "$CNI_CLUSTER2" == "OVNKubernetes" ]]; then
+    # Check if any pinger failed (Gateway tunnel OR RouteAgent pinger)
+    # Gateway tunnel status from earlier detection
+    # RouteAgent status: check if any RouteAgent has error status
+    ROUTEAGENT_ERROR_C1="false"
+    ROUTEAGENT_ERROR_C2="false"
+
+    if [[ "$CNI_CLUSTER1" == "OVNKubernetes" ]]; then
+        if grep -q 'status: error' "${OUTPUT_DIR}/cluster1/routeagents.yaml" 2>/dev/null; then
+            ROUTEAGENT_ERROR_C1="true"
+        fi
+    fi
+
+    if [[ "$CNI_CLUSTER2" == "OVNKubernetes" ]]; then
+        if grep -q 'status: error' "${OUTPUT_DIR}/cluster2/routeagents.yaml" 2>/dev/null; then
+            ROUTEAGENT_ERROR_C2="true"
+        fi
+    fi
+
+    # Trigger collection if Gateway tunnel failed OR RouteAgent pinger failed
+    if [ "$TUNNEL_STATUS_CLUSTER1" != "connected" ] || [ "$TUNNEL_STATUS_CLUSTER2" != "connected" ] || \
+       [ "$ROUTEAGENT_ERROR_C1" == "true" ] || [ "$ROUTEAGENT_ERROR_C2" == "true" ]; then
+        echo "  ✓ OVN-K CNI detected with pinger failures - collecting host networking diagnostics"
+        echo ""
+        mkdir -p "${OUTPUT_DIR}/ovnk-pinger"
+
+        echo "" >> "${OUTPUT_DIR}/manifest.txt"
+        echo "OVN-K Pinger Diagnostics:" >> "${OUTPUT_DIR}/manifest.txt"
+        echo "  CNI: Cluster1=${CNI_CLUSTER1}, Cluster2=${CNI_CLUSTER2}" >> "${OUTPUT_DIR}/manifest.txt"
+        echo "  Reason: Collecting ICMP health check packet flow for routing diagnosis" >> "${OUTPUT_DIR}/manifest.txt"
+
+        # Collect from cluster1 if it's OVN-K and pinger failed (Gateway OR RouteAgent)
+        if [[ "$CNI_CLUSTER1" == "OVNKubernetes" ]] && \
+           ([ "$TUNNEL_STATUS_CLUSTER1" != "connected" ] || [ "$ROUTEAGENT_ERROR_C1" == "true" ]); then
+            # Get remote health check IP from cluster1's endpoint
+            HEALTH_CHECK_IP_C1=$(kubectl get endpoints.submariner.io -n submariner-operator \
+                --kubeconfig="${KUBECONFIG1}" --context="${CLUSTER1_CONTEXT}" \
+                -o jsonpath='{.items[?(@.metadata.labels.submariner-io/clusterID!="'$(kubectl get submariner -n submariner-operator --kubeconfig="${KUBECONFIG1}" --context="${CLUSTER1_CONTEXT}" -o jsonpath='{.spec.clusterID}' 2>/dev/null)'")].spec.healthCheckIP}' 2>/dev/null | head -1)
+
+            if [ -n "$HEALTH_CHECK_IP_C1" ]; then
+                collect_ovnk_pinger_tcpdump "cluster1" "${KUBECONFIG1}" "${CLUSTER1_CONTEXT}" "${OUTPUT_DIR}/ovnk-pinger" "${HEALTH_CHECK_IP_C1}" &
+                PID_OVNK1=$!
+            fi
+        fi
+
+        # Collect from cluster2 if it's OVN-K and pinger failed (Gateway OR RouteAgent)
+        if [[ "$CNI_CLUSTER2" == "OVNKubernetes" ]] && \
+           ([ "$TUNNEL_STATUS_CLUSTER2" != "connected" ] || [ "$ROUTEAGENT_ERROR_C2" == "true" ]); then
+            HEALTH_CHECK_IP_C2=$(kubectl get endpoints.submariner.io -n submariner-operator \
+                --kubeconfig="${KUBECONFIG2}" --context="${CLUSTER2_CONTEXT}" \
+                -o jsonpath='{.items[?(@.metadata.labels.submariner-io/clusterID!="'$(kubectl get submariner -n submariner-operator --kubeconfig="${KUBECONFIG2}" --context="${CLUSTER2_CONTEXT}" -o jsonpath='{.spec.clusterID}' 2>/dev/null)'")].spec.healthCheckIP}' 2>/dev/null | head -1)
+
+            if [ -n "$HEALTH_CHECK_IP_C2" ]; then
+                collect_ovnk_pinger_tcpdump "cluster2" "${KUBECONFIG2}" "${CLUSTER2_CONTEXT}" "${OUTPUT_DIR}/ovnk-pinger" "${HEALTH_CHECK_IP_C2}" &
+                PID_OVNK2=$!
+            fi
+        fi
+
+        # Wait for both to complete
+        [ -n "$PID_OVNK1" ] && wait $PID_OVNK1
+        [ -n "$PID_OVNK2" ] && wait $PID_OVNK2
+
+        # Check if any pcap files were collected
+        OVNK_PCAP_COUNT=$(find "${OUTPUT_DIR}/ovnk-pinger" -name "*.pcap" 2>/dev/null | wc -l)
+        if [ "$OVNK_PCAP_COUNT" -eq 0 ]; then
+            echo "  ⚠ No pinger pcap files collected"
+            rmdir "${OUTPUT_DIR}/ovnk-pinger" 2>/dev/null
+        else
+            echo "  ✓ Collected ${OVNK_PCAP_COUNT} OVN-K pinger pcap file(s)"
+            echo "    Files: Cluster1=${HEALTH_CHECK_IP_C1:-none}, Cluster2=${HEALTH_CHECK_IP_C2:-none}" >> "${OUTPUT_DIR}/manifest.txt"
+        fi
+    else
+        echo "  → Pinger healthy on both clusters - skipping OVN-K diagnostics"
+    fi
+else
+    echo "  → No OVN-K CNI detected - skipping OVN-K pinger diagnostics"
+fi
+
+# OVN-K table 150 supplemental collection
+# This fills the gap left by subctl gather which only collects from gateway nodes
+echo ""
+echo "=== OVN-K Table 150 Supplemental Collection ==="
+if [[ "$CNI_CLUSTER1" == "OVNKubernetes" ]] || [[ "$CNI_CLUSTER2" == "OVNKubernetes" ]]; then
+    echo "OVN-Kubernetes CNI detected - collecting table 150 from all nodes"
+    echo "Note: subctl gather only collects table 150 from gateway nodes."
+    echo "      This supplemental collection ensures complete offline diagnostics."
+    echo ""
+
+    if [[ "$CNI_CLUSTER1" == "OVNKubernetes" ]]; then
+        collect_ovnk_table150_all_nodes "cluster1" "${KUBECONFIG1}" "${CLUSTER1_CONTEXT}" "${OUTPUT_DIR}/cluster1/gather/cluster1"
+    fi
+
+    if [[ "$CNI_CLUSTER2" == "OVNKubernetes" ]]; then
+        collect_ovnk_table150_all_nodes "cluster2" "${KUBECONFIG2}" "${CLUSTER2_CONTEXT}" "${OUTPUT_DIR}/cluster2/gather/cluster2"
+    fi
+else
+    echo "No OVN-K CNI detected - skipping table 150 collection"
+fi
+
+# nftables collection (collects from all Submariner versions)
+echo ""
+echo "=== Collecting nftables rules ==="
+collect_nftables_all_nodes "cluster1" "${KUBECONFIG1}" "${CLUSTER1_CONTEXT}" "${OUTPUT_DIR}/cluster1/gather/cluster1"
+if [[ -n "${KUBECONFIG2}" ]]; then
+    collect_nftables_all_nodes "cluster2" "${KUBECONFIG2}" "${CLUSTER2_CONTEXT}" "${OUTPUT_DIR}/cluster2/gather/cluster2"
 fi
 
 # Firewall diagnostics collection
@@ -1456,7 +1928,7 @@ if [ "$SKIP_VERIFY" = "false" ]; then
 
     # Merge kubeconfigs temporarily for subctl verify
     MERGED_KUBECONFIG="${OUTPUT_DIR}/merged-kubeconfig"
-    KUBECONFIG="${KUBECONFIG1}:${KUBECONFIG2}" kubectl config view --flatten > "${MERGED_KUBECONFIG}"
+    merge_kubeconfigs_safely "${KUBECONFIG1}" "${KUBECONFIG2}" "${MERGED_KUBECONFIG}" "${CLUSTER1_CONTEXT}" "${CLUSTER2_CONTEXT}"
 
     echo ""
     echo "Running subctl verify for connectivity (using --only ${VERIFY_CONNECTIVITY_FLAG})..."
