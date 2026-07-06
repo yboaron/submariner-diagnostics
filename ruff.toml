@@ -1,0 +1,17 @@
+line-length = 150
+
+[lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "W",    # pycodestyle warnings
+    "I",    # isort
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "SIM",  # flake8-simplify
+    "C4",   # flake8-comprehensions
+]
+ignore = [
+    "E501",   # line-too-long — diagnostic output strings are naturally long
+    "SIM102", # collapsible-if — nested ifs are more readable than 150-char single lines
+]

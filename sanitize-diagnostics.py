@@ -8,8 +8,10 @@ import ipaddress
 import os
 import re
 import sys
-import yaml
 from pathlib import Path
+
+import yaml
+
 
 class DiagnosticSanitizer:
     def __init__(self, output_dir):
@@ -42,7 +44,7 @@ class DiagnosticSanitizer:
                 return
 
         try:
-            with open(manifest_path, 'r') as f:
+            with open(manifest_path) as f:
                 manifest = yaml.safe_load(f)
 
             for cluster_info in manifest.get('clusters', []):
@@ -105,9 +107,7 @@ class DiagnosticSanitizer:
             if second >= 128 or second == 244:
                 return 'POD'
             return 'PRIVATE'
-        elif first == 172 and 16 <= second <= 31:
-            return 'PRIVATE'
-        elif first == 192 and second == 168:
+        elif first == 172 and 16 <= second <= 31 or first == 192 and second == 168:
             return 'PRIVATE'
         return 'PUBLIC'
 
@@ -189,7 +189,7 @@ class DiagnosticSanitizer:
     def sanitize_file(self, file_path):
         """Sanitize a single file"""
         try:
-            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            with open(file_path, encoding='utf-8', errors='ignore') as f:
                 content = f.read()
 
             sanitized = self.sanitize_content(content)

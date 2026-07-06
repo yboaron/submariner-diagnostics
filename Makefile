@@ -1,6 +1,8 @@
 BASE_BRANCH ?= devel
 export BASE_BRANCH
 
+SHELLCHECK_ARGS += $(shell find . -name '*.sh' -not -path './.git/*')
+
 ifneq (,$(DAPPER_HOST_ARCH))
 
 # Running in Dapper

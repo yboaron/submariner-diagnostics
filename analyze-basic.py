@@ -4,17 +4,19 @@ Submariner Basic Diagnostic Analyzer
 Automated pattern-matching analysis of Submariner diagnostics data
 """
 
-import sys
-import os
-import tarfile
-import yaml
-import re
-import ipaddress
-import subprocess
-import json
 import argparse
 import glob
+import ipaddress
+import json
+import os
+import re
+import subprocess
+import sys
+import tarfile
 from datetime import datetime
+
+import yaml
+
 
 class Colors:
     """ANSI color codes for terminal output"""
@@ -84,9 +86,9 @@ class SubmarinerAnalyzer:
                             try:
                                 if os.path.commonpath([os.path.abspath('.'), member_path]) != os.path.abspath('.'):
                                     raise Exception(f"Attempted path traversal in tar file: {member.name}")
-                            except ValueError:
+                            except ValueError as err:
                                 # Different drives on Windows or invalid path
-                                raise Exception(f"Attempted path traversal in tar file: {member.name}")
+                                raise Exception(f"Attempted path traversal in tar file: {member.name}") from err
                         tar.extractall()  # nosec B202 - validated above
                     self._print(f"{Colors.OKGREEN}✓{Colors.ENDC} Extracted to {root_dir}/")
                 else:
@@ -103,9 +105,9 @@ class SubmarinerAnalyzer:
         if not os.path.exists(full_path):
             return None
         try:
-            with open(full_path, 'r') as f:
+            with open(full_path) as f:
                 return f.read()
-        except (OSError, IOError):
+        except OSError:
             return None
 
     def read_yaml(self, relative_path):
@@ -1825,9 +1827,9 @@ class SubmarinerAnalyzer:
                     self._print("    1. Collect operator logs for HA election analysis:")
                     self._print("       kubectl logs -n submariner-operator deployment/submariner-operator > operator.log")
                     self._print("    2. Collect gateway pod logs from ALL gateway pods:")
-                    for pod_name, node_name in active_pods:
+                    for pod_name, _node_name in active_pods:
                         self._print(f"       kubectl logs -n submariner-operator {pod_name} > {pod_name}.log")
-                    for pod_name, node_name in passive_pods:
+                    for pod_name, _node_name in passive_pods:
                         self._print(f"       kubectl logs -n submariner-operator {pod_name} > {pod_name}.log")
                     self._print("    3. File a bug report with Submariner project:")
                     self._print("       https://github.com/submariner-io/submariner/issues")
@@ -2461,8 +2463,8 @@ class SubmarinerAnalyzer:
                 # Check for the local routing failure pattern
                 if gw_status == 'connected' and ra_data.get('errors', 0) > 0:
                     output.append("🔍 **ROOT CAUSE ANALYSIS:**")
-                    output.append(f"✓ Gateway → Remote Gateway: CONNECTED")
-                    output.append(f"✗ Non-gateway nodes → Remote Gateway: FAILED")
+                    output.append("✓ Gateway → Remote Gateway: CONNECTED")
+                    output.append("✗ Non-gateway nodes → Remote Gateway: FAILED")
                     output.append("")
                     output.append("**Datapath Segmentation:**")
                     output.append("```")
@@ -2949,16 +2951,12 @@ class SubmarinerAnalyzer:
             self._print(f"  {Colors.OKCYAN}Pattern detected:{Colors.ENDC} Gateway connected + RouteAgent errors")
             self._print(f"  {Colors.OKCYAN}Validating:{Colors.ENDC} Submariner OVN-K configuration")
 
-            # Summary of what we're checking
-            checks_passed = []
-            checks_failed = []
-
             # Summarize what THIS validation method checked
             # (Note: check_main_table_routes runs separately in the main analysis flow)
             self._print(f"\n  {Colors.BOLD}OVN-K Validation Summary:{Colors.ENDC}")
-            self._print(f"    ✓ OVN Logical Router Policies checked")
-            self._print(f"    ✓ Submariner CRs: GatewayRoute/NonGatewayRoute present")
-            self._print(f"    (IP rules and table 150 validated separately)")
+            self._print("    ✓ OVN Logical Router Policies checked")
+            self._print("    ✓ Submariner CRs: GatewayRoute/NonGatewayRoute present")
+            self._print("    (IP rules and table 150 validated separately)")
 
             # Check if we found any OVN issues
             ovn_issues = [issue for issue in self.issues if 'OVN' in issue and cluster in issue]
@@ -2966,13 +2964,13 @@ class SubmarinerAnalyzer:
             if not ovn_issues:
                 self._print(f"\n  {Colors.OKGREEN}✓ All expected Submariner OVN-K configuration appears correct{Colors.ENDC}")
                 self._print(f"\n  {Colors.BOLD}Analysis:{Colors.ENDC}")
-                self._print(f"    • Submariner configured OVN-Kubernetes as expected")
-                self._print(f"    • IP rules, table 150, and OVN policies all present")
-                self._print(f"    • Most likely an infrastructure or OVN-K platform issue")
+                self._print("    • Submariner configured OVN-Kubernetes as expected")
+                self._print("    • IP rules, table 150, and OVN policies all present")
+                self._print("    • Most likely an infrastructure or OVN-K platform issue")
                 self._print(f"\n  {Colors.BOLD}Recommendation:{Colors.ENDC}")
-                self._print(f"    Contact Submariner community with these findings:")
-                self._print(f"    - https://kubernetes.slack.com/archives/C010RJV694M")
-                self._print(f"    - https://github.com/submariner-io/submariner/issues")
+                self._print("    Contact Submariner community with these findings:")
+                self._print("    - https://kubernetes.slack.com/archives/C010RJV694M")
+                self._print("    - https://github.com/submariner-io/submariner/issues")
             else:
                 self._print(f"\n  {Colors.FAIL}✗ Found {len(ovn_issues)} OVN configuration issue(s){Colors.ENDC}")
                 for issue in ovn_issues[:3]:  # Show first 3
@@ -3085,13 +3083,11 @@ class SubmarinerAnalyzer:
     def _analyze_nftables_file(self, nft_file, cluster, node_name, globalnet_enabled, is_gateway=False):
         """Parse and analyze a single nftables file."""
         try:
-            with open(nft_file, 'r', encoding='utf-8') as f:
+            with open(nft_file, encoding='utf-8') as f:
                 content = f.read()
-        except (IOError, OSError, UnicodeDecodeError) as e:
+        except (OSError, UnicodeDecodeError) as e:
             self._print(f"    {Colors.WARNING}⚠{Colors.ENDC} Failed to read nftables file from {node_name}: {e}")
             return
-
-        node_label = "gateway" if is_gateway else "worker"
 
         # Check 1: Globalnet SNAT rules (only on gateway, only if globalnet enabled)
         if is_gateway and globalnet_enabled:
@@ -3133,7 +3129,7 @@ class SubmarinerAnalyzer:
             packets = int(counter_match.group(1))
             if packets == 0:
                 self._print(f"    {Colors.WARNING}⚠{Colors.ENDC} Globalnet SNAT rule exists but 0 packets matched")
-                self._print(f"      → Likely: Traffic not reaching nftables (check IP rules)")
+                self._print("      → Likely: Traffic not reaching nftables (check IP rules)")
 
     def _check_mss_clamping(self, nft_content, cluster, node_name):
         """Check MSS clamping packet counters."""
@@ -3176,9 +3172,9 @@ class SubmarinerAnalyzer:
             node_name = os.path.basename(nft_file).replace('_nftables.log', '')
 
             try:
-                with open(nft_file, 'r', encoding='utf-8') as f:
+                with open(nft_file, encoding='utf-8') as f:
                     content = f.read()
-            except (IOError, OSError, UnicodeDecodeError):
+            except (OSError, UnicodeDecodeError):
                 continue
 
             # Find mgmtport-no-snat-subnets-v4 set
@@ -3592,7 +3588,7 @@ class SubmarinerAnalyzer:
                 self._print(f"        {Colors.WARNING}Cause:{Colors.ENDC} Table 150 route missing or IP rules misconfigured")
             else:
                 self._print(f"      {Colors.OKGREEN}✓{Colors.ENDC} Worker {node_name}: Packets captured on ovn-k8s-mp0 ({file_size} bytes)")
-                self._print(f"        Segment 1 appears healthy (traffic reaching OVN)")
+                self._print("        Segment 1 appears healthy (traffic reaching OVN)")
 
                 # Check 'any' interface to see if packets go beyond ovn-k8s-mp0
                 any_pcap = pcap.replace('ovnk8smp0', 'any')
@@ -3600,7 +3596,7 @@ class SubmarinerAnalyzer:
                     any_path = os.path.join(ovnk_pinger_dir, any_pcap)
                     any_size = os.path.getsize(any_path)
                     if any_size > file_size:
-                        self._print(f"        Segment 2/3: Additional analysis needed (packets on 'any' interface)")
+                        self._print("        Segment 2/3: Additional analysis needed (packets on 'any' interface)")
 
         # NOTE: We only capture ovn-k8s-mp0 and 'any' - no br-ex (platform-specific)
         # Gateway analysis would check 'any' interface for tunnel traffic if needed
@@ -3619,7 +3615,7 @@ class SubmarinerAnalyzer:
         gateway_result = None
         worker_results = []
 
-        for node_name, result in node_results.items():
+        for _node_name, result in node_results.items():
             if result['is_gateway']:
                 gateway_result = result
             else:
@@ -3678,7 +3674,7 @@ class SubmarinerAnalyzer:
             # This is critical failure
             self._print(f"\n    {Colors.FAIL}🔍 ROOT CAUSE IDENTIFIED:{Colors.ENDC}")
             self._print(f"      Table 150 route is MISSING on {len(check2_failures)} node(s)")
-            self._print(f"      This prevents host networking traffic from reaching OVN datapath")
+            self._print("      This prevents host networking traffic from reaching OVN datapath")
 
             self.faulty_states.append(f"{cluster}: Table 150 route missing on {len(check2_failures)} nodes")
             self.issues.append(f"{cluster}: OVN-K host networking misconfiguration (table 150)")
@@ -3732,9 +3728,9 @@ class SubmarinerAnalyzer:
                     self._print(f"\n    {Colors.FAIL}🔍 CRITICAL ERROR DETECTED in gateway logs:{Colors.ENDC}")
                     self._print(f"      Error: 'write ip 0.0.0.0->{dest_ip}: sendmsg: object is remote'")
                     self._print(f"\n      {Colors.WARNING}Diagnosis:{Colors.ENDC}")
-                    self._print(f"      Source IP = 0.0.0.0 indicates routing failure")
-                    self._print(f"      Kernel could not select source IP from ovn-k8s-mp0")
-                    self._print(f"      Most likely: Table 150 route missing OR ovn-k8s-mp0 has no IP")
+                    self._print("      Source IP = 0.0.0.0 indicates routing failure")
+                    self._print("      Kernel could not select source IP from ovn-k8s-mp0")
+                    self._print("      Most likely: Table 150 route missing OR ovn-k8s-mp0 has no IP")
 
                     self.faulty_states.append(f"{cluster}: Gateway cannot send packets (0.0.0.0 source)")
                     self.issues.append(f"{cluster}: Gateway routing failure (0.0.0.0 source IP)")

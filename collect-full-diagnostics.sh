@@ -79,7 +79,8 @@ show_usage() {
 # Returns 0 if name is safe (no illegal chars), 1 if sanitization needed
 can_create_dir_with_name() {
     local test_name="$1"
-    local sanitized=$(sanitize_context_name "$test_name")
+    local sanitized
+    sanitized=$(sanitize_context_name "$test_name")
 
     # If sanitized name differs from original, illegal characters were found
     if [ "$sanitized" = "$test_name" ]; then
@@ -114,8 +115,10 @@ merge_kubeconfigs_safely() {
     fi
 
     # Extract contexts and their associated users
-    local context1_user=$(KUBECONFIG="${kubeconfig1}" kubectl config view -o jsonpath="{.contexts[?(@.name==\"${context1}\")].context.user}" 2>/dev/null)
-    local context2_user=$(KUBECONFIG="${kubeconfig2}" kubectl config view -o jsonpath="{.contexts[?(@.name==\"${context2}\")].context.user}" 2>/dev/null)
+    local context1_user
+    context1_user=$(KUBECONFIG="${kubeconfig1}" kubectl config view -o jsonpath="{.contexts[?(@.name==\"${context1}\")].context.user}" 2>/dev/null)
+    local context2_user
+    context2_user=$(KUBECONFIG="${kubeconfig2}" kubectl config view -o jsonpath="{.contexts[?(@.name==\"${context2}\")].context.user}" 2>/dev/null)
 
     # Check if both contexts use the same user name
     if [ "$context1_user" = "$context2_user" ] && [ -n "$context1_user" ]; then
@@ -172,7 +175,8 @@ with open('${temp_kc2}', 'w') as f:
 
 # Function to sanitize all collected files using Python script
 sanitize_diagnostics() {
-    local sanitize_script="$(dirname "$0")/sanitize-diagnostics.py"
+    local sanitize_script
+    sanitize_script="$(dirname "$0")/sanitize-diagnostics.py"
 
     # Check if Python sanitizer exists
     if [ ! -f "$sanitize_script" ]; then
@@ -358,7 +362,7 @@ collect_tcpdump_from_cluster() {
 
     # Create DaemonSet YAML for tcpdump
     echo "  Applying tcpdump DaemonSet..."
-    cat <<EOF | kubectl apply --kubeconfig="${kubeconfig}" --context="${context}" -f -
+    if ! kubectl apply --kubeconfig="${kubeconfig}" --context="${context}" -f - <<EOF
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -499,8 +503,7 @@ spec:
       serviceAccount: submariner-routeagent
       serviceAccountName: submariner-routeagent
 EOF
-
-    if [ $? -ne 0 ]; then
+    then
         echo "  ✗ Failed to deploy tcpdump DaemonSet on ${cluster_name}"
         # Attempt cleanup in case DaemonSet was partially created
         kubectl delete daemonset submariner-tcpdump-collector -n submariner-operator --kubeconfig="${kubeconfig}" --context="${context}" >/dev/null 2>&1
@@ -583,7 +586,8 @@ collect_ovnk_pinger_tcpdump() {
     echo "  Collecting OVN-K pinger diagnostics from ${cluster_name}..."
 
     # Get active gateway node
-    local gateway_node=$(kubectl get submariner submariner -n submariner-operator \
+    local gateway_node
+    gateway_node=$(kubectl get submariner submariner -n submariner-operator \
         --kubeconfig="${kubeconfig}" --context="${context}" \
         -o jsonpath='{.status.gateways[?(@.haStatus=="active")].localEndpoint.hostname}' 2>/dev/null)
 
@@ -593,7 +597,8 @@ collect_ovnk_pinger_tcpdump() {
     fi
 
     # Get a worker node (preferably one with RouteAgent error)
-    local worker_node=$(kubectl get routeagents -n submariner-operator \
+    local worker_node
+    worker_node=$(kubectl get routeagents -n submariner-operator \
         --kubeconfig="${kubeconfig}" --context="${context}" \
         -o jsonpath='{.items[?(@.status.remoteEndpoints[0].status=="error")].metadata.name}' 2>/dev/null | head -1 | awk '{print $1}')
 
@@ -614,7 +619,7 @@ collect_ovnk_pinger_tcpdump() {
 
     # Deploy DaemonSet for tcpdump collection
     echo "    Deploying OVN-K pinger tcpdump DaemonSet..."
-    cat <<EOF | kubectl apply --kubeconfig="${kubeconfig}" --context="${context}" -f -
+    if ! kubectl apply --kubeconfig="${kubeconfig}" --context="${context}" -f - <<EOF
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -674,8 +679,7 @@ spec:
       serviceAccount: submariner-routeagent
       serviceAccountName: submariner-routeagent
 EOF
-
-    if [ $? -ne 0 ]; then
+    then
         echo "    ✗ Failed to deploy OVN-K pinger tcpdump DaemonSet on ${cluster_name}"
         kubectl delete daemonset submariner-ovnk-pinger-tcpdump -n submariner-operator \
             --kubeconfig="${kubeconfig}" --context="${context}" >/dev/null 2>&1
@@ -695,7 +699,8 @@ EOF
     sleep 120
 
     # Extract files from gateway pod
-    local gw_tcpdump_pod=$(kubectl get pods -n submariner-operator -l app=submariner-ovnk-pinger-tcpdump \
+    local gw_tcpdump_pod
+    gw_tcpdump_pod=$(kubectl get pods -n submariner-operator -l app=submariner-ovnk-pinger-tcpdump \
         --kubeconfig="${kubeconfig}" --context="${context}" \
         -o jsonpath="{.items[?(@.spec.nodeName==\"${gateway_node}\")].metadata.name}" 2>/dev/null)
 
@@ -709,15 +714,16 @@ EOF
                 cat /tmp/gw-${checkpoint}.pcap > "${pcap_file}" 2>/dev/null
 
             if [ -f "${pcap_file}" ] && [ -s "${pcap_file}" ]; then
-                echo "      ✓ Collected: $(basename ${pcap_file})"
+                echo "      ✓ Collected: $(basename "${pcap_file}")"
                 tcpdump -r "${pcap_file}" -n -v > "${txt_file}" 2>/dev/null && \
-                    echo "      ✓ Analysis: $(basename ${txt_file})"
+                    echo "      ✓ Analysis: $(basename "${txt_file}")"
             fi
         done
     fi
 
     # Extract files from worker pod
-    local worker_tcpdump_pod=$(kubectl get pods -n submariner-operator -l app=submariner-ovnk-pinger-tcpdump \
+    local worker_tcpdump_pod
+    worker_tcpdump_pod=$(kubectl get pods -n submariner-operator -l app=submariner-ovnk-pinger-tcpdump \
         --kubeconfig="${kubeconfig}" --context="${context}" \
         -o jsonpath="{.items[?(@.spec.nodeName==\"${worker_node}\")].metadata.name}" 2>/dev/null)
 
@@ -731,9 +737,9 @@ EOF
                 cat /tmp/worker-${checkpoint}.pcap > "${pcap_file}" 2>/dev/null
 
             if [ -f "${pcap_file}" ] && [ -s "${pcap_file}" ]; then
-                echo "      ✓ Collected: $(basename ${pcap_file})"
+                echo "      ✓ Collected: $(basename "${pcap_file}")"
                 tcpdump -r "${pcap_file}" -n -v > "${txt_file}" 2>/dev/null && \
-                    echo "      ✓ Analysis: $(basename ${txt_file})"
+                    echo "      ✓ Analysis: $(basename "${txt_file}")"
             fi
         done
     fi
@@ -754,7 +760,8 @@ collect_ovnk_table150_all_nodes() {
     echo "  Collecting table 150 routes from all nodes (${cluster_name})..."
 
     # Get all RouteAgent pods
-    local routeagent_pods=$(kubectl --context "$context" get pods -n submariner-operator \
+    local routeagent_pods
+    routeagent_pods=$(kubectl --context "$context" get pods -n submariner-operator \
         -l app=submariner-routeagent -o name --kubeconfig="${kubeconfig}" 2>/dev/null)
 
     if [[ -z "$routeagent_pods" ]]; then
@@ -766,10 +773,10 @@ collect_ovnk_table150_all_nodes() {
 
     # For each RouteAgent pod
     while IFS= read -r pod; do
-        local pod_name=$(basename "$pod")
 
         # Get node name
-        local node_name=$(kubectl --context "$context" get "$pod" -n submariner-operator \
+        local node_name
+        node_name=$(kubectl --context "$context" get "$pod" -n submariner-operator \
             -o jsonpath='{.spec.nodeName}' --kubeconfig="${kubeconfig}" 2>/dev/null)
 
         if [[ -z "$node_name" ]]; then
@@ -779,13 +786,11 @@ collect_ovnk_table150_all_nodes() {
         # Collect table 150 route (unconditionally - simple and consistent)
         local output_file="${gather_dir}/${node_name}_ip-routes-table150.log"
 
-        {
+        if {
             echo "ip route show table 150"
             kubectl --context "$context" exec -n submariner-operator "$pod" --kubeconfig="${kubeconfig}" -- \
                 ip route show table 150 2>&1
-        } > "$output_file" 2>&1
-
-        if [[ $? -eq 0 ]]; then
+        } > "$output_file" 2>&1; then
             ((collected_count++))
         else
             echo "    ⚠ ${node_name}: Failed to collect"
@@ -807,7 +812,8 @@ collect_nftables_all_nodes() {
     echo "  Collecting nftables rules from all nodes (${cluster_name})..."
 
     # Get all RouteAgent pods
-    local routeagent_pods=$(kubectl --context "$context" get pods -n submariner-operator \
+    local routeagent_pods
+    routeagent_pods=$(kubectl --context "$context" get pods -n submariner-operator \
         -l app=submariner-routeagent -o name --kubeconfig="${kubeconfig}" 2>/dev/null)
 
     if [[ -z "$routeagent_pods" ]]; then
@@ -819,10 +825,10 @@ collect_nftables_all_nodes() {
 
     # For each RouteAgent pod
     while IFS= read -r pod; do
-        local pod_name=$(basename "$pod")
 
         # Get node name
-        local node_name=$(kubectl --context "$context" get "$pod" -n submariner-operator \
+        local node_name
+        node_name=$(kubectl --context "$context" get "$pod" -n submariner-operator \
             -o jsonpath='{.spec.nodeName}' --kubeconfig="${kubeconfig}" 2>/dev/null)
 
         if [[ -z "$node_name" ]]; then
@@ -832,13 +838,11 @@ collect_nftables_all_nodes() {
         # Collect nftables ruleset
         local output_file="${gather_dir}/${node_name}_nftables.log"
 
-        {
+        if {
             echo "nft list ruleset"
             kubectl --context "$context" exec -n submariner-operator "$pod" --kubeconfig="${kubeconfig}" -- \
                 nft list ruleset 2>&1
-        } > "$output_file" 2>&1
-
-        if [[ $? -eq 0 ]]; then
+        } > "$output_file" 2>&1; then
             ((collected_count++))
         else
             echo "    ⚠ ${node_name}: Failed to collect (nft might not be available)"
@@ -856,6 +860,10 @@ collect_firewall_inter_cluster() {
     local kubeconfig2="$4"
     local firewall_dir="$5"
     local image_override="$6"
+    local image_override_args=()
+    if [ -n "$image_override" ]; then
+        read -ra image_override_args <<< "$image_override"
+    fi
 
     echo "=== Collecting firewall inter-cluster diagnostics ==="
     echo "  This tests firewall requirements for inter-cluster traffic"
@@ -870,16 +878,18 @@ collect_firewall_inter_cluster() {
         FIREWALL_CMD="${FIREWALL_CMD} ${image_override}"
     fi
 
-    echo "========================================" > "${firewall_dir}/firewall-inter-cluster.txt"
-    echo "Command executed:" >> "${firewall_dir}/firewall-inter-cluster.txt"
-    echo "${FIREWALL_CMD}" >> "${firewall_dir}/firewall-inter-cluster.txt"
-    echo "========================================" >> "${firewall_dir}/firewall-inter-cluster.txt"
-    echo "" >> "${firewall_dir}/firewall-inter-cluster.txt"
-    echo "CONTEXT: This test was run because:" >> "${firewall_dir}/firewall-inter-cluster.txt"
-    echo "  - Tunnel not connected on one or both clusters" >> "${firewall_dir}/firewall-inter-cluster.txt"
-    echo "  - Inter-cluster traffic uses UDP encapsulation (VxLAN or IPSec with NAT-T)" >> "${firewall_dir}/firewall-inter-cluster.txt"
-    echo "  - Testing if firewall rules are blocking inter-cluster traffic" >> "${firewall_dir}/firewall-inter-cluster.txt"
-    echo "" >> "${firewall_dir}/firewall-inter-cluster.txt"
+    {
+    echo "========================================"
+    echo "Command executed:"
+    echo "${FIREWALL_CMD}"
+    echo "========================================"
+    echo ""
+    echo "CONTEXT: This test was run because:"
+    echo "  - Tunnel not connected on one or both clusters"
+    echo "  - Inter-cluster traffic uses UDP encapsulation (VxLAN or IPSec with NAT-T)"
+    echo "  - Testing if firewall rules are blocking inter-cluster traffic"
+    echo ""
+    } > "${firewall_dir}/firewall-inter-cluster.txt"
 
     echo "  Running firewall inter-cluster test..."
     echo "  Start time: $(date '+%Y-%m-%d %H:%M:%S')"
@@ -889,7 +899,7 @@ collect_firewall_inter_cluster() {
         --context "${cluster1_name}" \
         --remotecontext "${cluster2_name}" \
         --verbose \
-        ${image_override} \
+        "${image_override_args[@]}" \
         >> "${firewall_dir}/firewall-inter-cluster.txt" 2>&1
 
     FW_EXIT_CODE=$?
@@ -913,6 +923,10 @@ collect_firewall_intra_cluster() {
     local context="$3"
     local firewall_dir="$4"
     local image_override="$5"
+    local image_override_args=()
+    if [ -n "$image_override" ]; then
+        read -ra image_override_args <<< "$image_override"
+    fi
 
     echo "=== Collecting firewall intra-cluster diagnostics for ${cluster_name} ==="
     echo "  This tests firewall requirements for intra-cluster Submariner traffic"
@@ -923,15 +937,17 @@ collect_firewall_intra_cluster() {
         FIREWALL_CMD="${FIREWALL_CMD} ${image_override}"
     fi
 
-    echo "========================================" > "${firewall_dir}/firewall-intra-cluster-${cluster_name}.txt"
-    echo "Command executed:" >> "${firewall_dir}/firewall-intra-cluster-${cluster_name}.txt"
-    echo "${FIREWALL_CMD}" >> "${firewall_dir}/firewall-intra-cluster-${cluster_name}.txt"
-    echo "========================================" >> "${firewall_dir}/firewall-intra-cluster-${cluster_name}.txt"
-    echo "" >> "${firewall_dir}/firewall-intra-cluster-${cluster_name}.txt"
-    echo "CONTEXT: This test was run because:" >> "${firewall_dir}/firewall-intra-cluster-${cluster_name}.txt"
-    echo "  - CNI is not OVN-Kubernetes (intra-cluster firewall requirements apply)" >> "${firewall_dir}/firewall-intra-cluster-${cluster_name}.txt"
-    echo "  - Testing if firewall rules are blocking intra-cluster Submariner traffic" >> "${firewall_dir}/firewall-intra-cluster-${cluster_name}.txt"
-    echo "" >> "${firewall_dir}/firewall-intra-cluster-${cluster_name}.txt"
+    {
+    echo "========================================"
+    echo "Command executed:"
+    echo "${FIREWALL_CMD}"
+    echo "========================================"
+    echo ""
+    echo "CONTEXT: This test was run because:"
+    echo "  - CNI is not OVN-Kubernetes (intra-cluster firewall requirements apply)"
+    echo "  - Testing if firewall rules are blocking intra-cluster Submariner traffic"
+    echo ""
+    } > "${firewall_dir}/firewall-intra-cluster-${cluster_name}.txt"
 
     echo "  Running firewall intra-cluster test for ${cluster_name}..."
     echo "  Start time: $(date '+%Y-%m-%d %H:%M:%S')"
@@ -941,7 +957,7 @@ collect_firewall_intra_cluster() {
         --kubeconfig "${kubeconfig}" \
         --context "${context}" \
         --verbose \
-        ${image_override} \
+        "${image_override_args[@]}" \
         >> "${firewall_dir}/firewall-intra-cluster-${cluster_name}.txt" 2>&1
 
     FW_EXIT_CODE=$?
@@ -962,7 +978,8 @@ check_version_compatibility() {
     local cluster_name="$3"
 
     # Get Submariner version from cluster
-    local submariner_version=$(subctl show versions --kubeconfig="${kubeconfig}" --context="${context}" 2>/dev/null | grep -E 'submariner-gateway|submariner-operator' | awk '{print $3}' | head -1 | grep -oP 'release-\K[0-9]+\.[0-9]+' | head -1)
+    local submariner_version
+    submariner_version=$(subctl show versions --kubeconfig="${kubeconfig}" --context="${context}" 2>/dev/null | grep -E 'submariner-gateway|submariner-operator' | awk '{print $3}' | head -1 | grep -oP 'release-\K[0-9]+\.[0-9]+' | head -1)
 
     if [ -z "$submariner_version" ]; then
         echo "  ${cluster_name}: ⚠ Unable to detect Submariner version"
@@ -1082,9 +1099,7 @@ if [ "$CLUSTER1_CONTEXT" = "$CLUSTER2_CONTEXT" ]; then
 
     # Rename context in the copy using kubectl
     # This renames: context name, cluster reference, and user reference
-    KUBECONFIG="$KUBECONFIG1_MODIFIED" kubectl config rename-context "$CLUSTER1_CONTEXT" "$NEW_CLUSTER1_CONTEXT" >/dev/null 2>&1
-
-    if [ $? -eq 0 ]; then
+    if KUBECONFIG="$KUBECONFIG1_MODIFIED" kubectl config rename-context "$CLUSTER1_CONTEXT" "$NEW_CLUSTER1_CONTEXT" >/dev/null 2>&1; then
         echo "  ✓ Created modified kubeconfig: $KUBECONFIG1_MODIFIED"
         echo "  ✓ Renamed context: '$CLUSTER1_CONTEXT' → '$NEW_CLUSTER1_CONTEXT'"
         echo "  ✓ Original kubeconfig preserved: $KUBECONFIG1"
@@ -1146,9 +1161,7 @@ if ! can_create_dir_with_name "$CLUSTER1_CONTEXT"; then
     SANITIZED_CLUSTER1_CONTEXT=$(sanitize_context_name "$CLUSTER1_CONTEXT")
 
     # Rename context
-    KUBECONFIG="$KUBECONFIG1_SANITIZED" kubectl config rename-context "$CLUSTER1_CONTEXT" "$SANITIZED_CLUSTER1_CONTEXT" >/dev/null 2>&1
-
-    if [ $? -eq 0 ]; then
+    if KUBECONFIG="$KUBECONFIG1_SANITIZED" kubectl config rename-context "$CLUSTER1_CONTEXT" "$SANITIZED_CLUSTER1_CONTEXT" >/dev/null 2>&1; then
         echo "  ✓ Created sanitized kubeconfig: $KUBECONFIG1_SANITIZED"
         echo "  ✓ Sanitized context name: '$CLUSTER1_CONTEXT' → '$SANITIZED_CLUSTER1_CONTEXT'"
         echo "  ✓ Original kubeconfig preserved: $KUBECONFIG1"
@@ -1189,9 +1202,7 @@ if ! can_create_dir_with_name "$CLUSTER2_CONTEXT"; then
     SANITIZED_CLUSTER2_CONTEXT=$(sanitize_context_name "$CLUSTER2_CONTEXT")
 
     # Rename context
-    KUBECONFIG="$KUBECONFIG2_SANITIZED" kubectl config rename-context "$CLUSTER2_CONTEXT" "$SANITIZED_CLUSTER2_CONTEXT" >/dev/null 2>&1
-
-    if [ $? -eq 0 ]; then
+    if KUBECONFIG="$KUBECONFIG2_SANITIZED" kubectl config rename-context "$CLUSTER2_CONTEXT" "$SANITIZED_CLUSTER2_CONTEXT" >/dev/null 2>&1; then
         echo "  ✓ Created sanitized kubeconfig: $KUBECONFIG2_SANITIZED"
         echo "  ✓ Sanitized context name: '$CLUSTER2_CONTEXT' → '$SANITIZED_CLUSTER2_CONTEXT'"
         echo "  ✓ Original kubeconfig preserved: $KUBECONFIG2"
@@ -1370,22 +1381,26 @@ echo "Collecting Submariner diagnostics..."
 echo "Start time: $(date '+%Y-%m-%d %H:%M:%S')"
 echo "========================================="
 echo ""
-echo "Timestamp: ${TIMESTAMP}" > "${OUTPUT_DIR}/manifest.txt"
-echo "Complaint: ${COMPLAINT}" >> "${OUTPUT_DIR}/manifest.txt"
-echo "" >> "${OUTPUT_DIR}/manifest.txt"
-echo "Collection Log: See collection.log for detailed output and any errors" >> "${OUTPUT_DIR}/manifest.txt"
-echo "" >> "${OUTPUT_DIR}/manifest.txt"
+{
+echo "Timestamp: ${TIMESTAMP}"
+echo "Complaint: ${COMPLAINT}"
+echo ""
+echo "Collection Log: See collection.log for detailed output and any errors"
+echo ""
+} > "${OUTPUT_DIR}/manifest.txt"
 
 # Document context renaming if it occurred
 if [ "$CONTEXT_RENAMED" = "true" ]; then
-    echo "Context Name Handling:" >> "${OUTPUT_DIR}/manifest.txt"
-    echo "  ⚠ Overlapping context names detected and auto-fixed" >> "${OUTPUT_DIR}/manifest.txt"
-    echo "  Original cluster1 context: ${ORIGINAL_CLUSTER1_CONTEXT}" >> "${OUTPUT_DIR}/manifest.txt"
-    echo "  Original cluster2 context: ${CLUSTER2_CONTEXT}" >> "${OUTPUT_DIR}/manifest.txt"
-    echo "  Renamed cluster1 context: ${CLUSTER1_CONTEXT}" >> "${OUTPUT_DIR}/manifest.txt"
-    echo "  Action: Created temporary kubeconfig copy with renamed context" >> "${OUTPUT_DIR}/manifest.txt"
-    echo "  Note: This was required because subctl verify needs unique context names" >> "${OUTPUT_DIR}/manifest.txt"
-    echo "" >> "${OUTPUT_DIR}/manifest.txt"
+    {
+    echo "Context Name Handling:"
+    echo "  ⚠ Overlapping context names detected and auto-fixed"
+    echo "  Original cluster1 context: ${ORIGINAL_CLUSTER1_CONTEXT}"
+    echo "  Original cluster2 context: ${CLUSTER2_CONTEXT}"
+    echo "  Renamed cluster1 context: ${CLUSTER1_CONTEXT}"
+    echo "  Action: Created temporary kubeconfig copy with renamed context"
+    echo "  Note: This was required because subctl verify needs unique context names"
+    echo ""
+    } >> "${OUTPUT_DIR}/manifest.txt"
 fi
 
 # Document context sanitization if it occurred
@@ -1403,7 +1418,7 @@ if [ "$ORIGINAL_CLUSTER1_CONTEXT_SANITIZE" != "$CLUSTER1_CONTEXT" ] || [ "$ORIGI
         echo "  Sanitized cluster2 context: ${CLUSTER2_CONTEXT}" >> "${OUTPUT_DIR}/manifest.txt"
     fi
 
-    echo "  Note: Characters like ':', '/', '\\', '@' cannot be used in directory names" >> "${OUTPUT_DIR}/manifest.txt"
+    printf '%s\n' "  Note: Characters like ':', '/', '\\', '@' cannot be used in directory names" >> "${OUTPUT_DIR}/manifest.txt"
     echo "" >> "${OUTPUT_DIR}/manifest.txt"
 fi
 
@@ -1435,18 +1450,22 @@ fi
 echo "" >> "${OUTPUT_DIR}/manifest.txt"
 
 # Collect from Cluster 1
-echo "Cluster 1:" >> "${OUTPUT_DIR}/manifest.txt"
-echo "  Context: ${CLUSTER1_CONTEXT}" >> "${OUTPUT_DIR}/manifest.txt"
-echo "  Kubeconfig: ${KUBECONFIG1##*/}" >> "${OUTPUT_DIR}/manifest.txt"
-echo "" >> "${OUTPUT_DIR}/manifest.txt"
+{
+echo "Cluster 1:"
+echo "  Context: ${CLUSTER1_CONTEXT}"
+echo "  Kubeconfig: ${KUBECONFIG1##*/}"
+echo ""
+} >> "${OUTPUT_DIR}/manifest.txt"
 
 collect_cluster_diagnostics "cluster1" "${KUBECONFIG1}" "${CLUSTER1_CONTEXT}"
 
 # Collect from Cluster 2
-echo "Cluster 2:" >> "${OUTPUT_DIR}/manifest.txt"
-echo "  Context: ${CLUSTER2_CONTEXT}" >> "${OUTPUT_DIR}/manifest.txt"
-echo "  Kubeconfig: ${KUBECONFIG2##*/}" >> "${OUTPUT_DIR}/manifest.txt"
-echo "" >> "${OUTPUT_DIR}/manifest.txt"
+{
+echo "Cluster 2:"
+echo "  Context: ${CLUSTER2_CONTEXT}"
+echo "  Kubeconfig: ${KUBECONFIG2##*/}"
+echo ""
+} >> "${OUTPUT_DIR}/manifest.txt"
 
 collect_cluster_diagnostics "cluster2" "${KUBECONFIG2}" "${CLUSTER2_CONTEXT}"
 
@@ -1503,18 +1522,20 @@ if [ "$NETTEST_IMAGE_FAILED" = "true" ]; then
     echo ""
 
     # Document in manifest
-    echo "Image Pull Issues Detected:" >> "${OUTPUT_DIR}/manifest.txt"
-    echo "  ⚠ nettest image pull failures in subctl diagnose output" >> "${OUTPUT_DIR}/manifest.txt"
+    {
+    echo "Image Pull Issues Detected:"
+    echo "  ⚠ nettest image pull failures in subctl diagnose output"
     if [ -n "$NETTEST_IMAGE_C1" ]; then
-        echo "  Cluster1 image: ${NETTEST_IMAGE_C1}" >> "${OUTPUT_DIR}/manifest.txt"
+        echo "  Cluster1 image: ${NETTEST_IMAGE_C1}"
     fi
     if [ -n "$NETTEST_IMAGE_C2" ]; then
-        echo "  Cluster2 image: ${NETTEST_IMAGE_C2}" >> "${OUTPUT_DIR}/manifest.txt"
+        echo "  Cluster2 image: ${NETTEST_IMAGE_C2}"
     fi
-    echo "  Affected test: 'Checking that gateway metrics are accessible from non-gateway nodes'" >> "${OUTPUT_DIR}/manifest.txt"
-    echo "  Action required: Fix nettest image availability and re-run collection" >> "${OUTPUT_DIR}/manifest.txt"
-    echo "  See console output above for detailed remediation steps" >> "${OUTPUT_DIR}/manifest.txt"
-    echo "" >> "${OUTPUT_DIR}/manifest.txt"
+    echo "  Affected test: 'Checking that gateway metrics are accessible from non-gateway nodes'"
+    echo "  Action required: Fix nettest image availability and re-run collection"
+    echo "  See console output above for detailed remediation steps"
+    echo ""
+    } >> "${OUTPUT_DIR}/manifest.txt"
 fi
 
 # Check tunnel status and collect tcpdump if tunnel is not connected
@@ -1540,11 +1561,13 @@ if [ "$TUNNEL_STATUS_CLUSTER1" != "connected" ] || [ "$TUNNEL_STATUS_CLUSTER2" !
 
     mkdir -p "${OUTPUT_DIR}/tcpdump"
 
-    echo "tcpdump Data Collection:" >> "${OUTPUT_DIR}/manifest.txt"
-    echo "  Reason: Tunnel not connected on one or both clusters" >> "${OUTPUT_DIR}/manifest.txt"
-    echo "  Cluster1 status: ${TUNNEL_STATUS_CLUSTER1}" >> "${OUTPUT_DIR}/manifest.txt"
-    echo "  Cluster2 status: ${TUNNEL_STATUS_CLUSTER2}" >> "${OUTPUT_DIR}/manifest.txt"
-    echo "" >> "${OUTPUT_DIR}/manifest.txt"
+    {
+    echo "tcpdump Data Collection:"
+    echo "  Reason: Tunnel not connected on one or both clusters"
+    echo "  Cluster1 status: ${TUNNEL_STATUS_CLUSTER1}"
+    echo "  Cluster2 status: ${TUNNEL_STATUS_CLUSTER2}"
+    echo ""
+    } >> "${OUTPUT_DIR}/manifest.txt"
 
     # Collect from both clusters in parallel (background processes)
     collect_tcpdump_from_cluster "cluster1" "${KUBECONFIG1}" "${CLUSTER1_CONTEXT}" "${OUTPUT_DIR}/tcpdump" 80 &
@@ -1617,18 +1640,20 @@ if [[ "$CNI_CLUSTER1" == "OVNKubernetes" ]] || [[ "$CNI_CLUSTER2" == "OVNKuberne
         echo ""
         mkdir -p "${OUTPUT_DIR}/ovnk-pinger"
 
-        echo "" >> "${OUTPUT_DIR}/manifest.txt"
-        echo "OVN-K Pinger Diagnostics:" >> "${OUTPUT_DIR}/manifest.txt"
-        echo "  CNI: Cluster1=${CNI_CLUSTER1}, Cluster2=${CNI_CLUSTER2}" >> "${OUTPUT_DIR}/manifest.txt"
-        echo "  Reason: Collecting ICMP health check packet flow for routing diagnosis" >> "${OUTPUT_DIR}/manifest.txt"
+        {
+        echo ""
+        echo "OVN-K Pinger Diagnostics:"
+        echo "  CNI: Cluster1=${CNI_CLUSTER1}, Cluster2=${CNI_CLUSTER2}"
+        echo "  Reason: Collecting ICMP health check packet flow for routing diagnosis"
+        } >> "${OUTPUT_DIR}/manifest.txt"
 
         # Collect from cluster1 if it's OVN-K and pinger failed (Gateway OR RouteAgent)
         if [[ "$CNI_CLUSTER1" == "OVNKubernetes" ]] && \
-           ([ "$TUNNEL_STATUS_CLUSTER1" != "connected" ] || [ "$ROUTEAGENT_ERROR_C1" == "true" ]); then
+           { [ "$TUNNEL_STATUS_CLUSTER1" != "connected" ] || [ "$ROUTEAGENT_ERROR_C1" == "true" ]; }; then
             # Get remote health check IP from cluster1's endpoint
             HEALTH_CHECK_IP_C1=$(kubectl get endpoints.submariner.io -n submariner-operator \
                 --kubeconfig="${KUBECONFIG1}" --context="${CLUSTER1_CONTEXT}" \
-                -o jsonpath='{.items[?(@.metadata.labels.submariner-io/clusterID!="'$(kubectl get submariner -n submariner-operator --kubeconfig="${KUBECONFIG1}" --context="${CLUSTER1_CONTEXT}" -o jsonpath='{.spec.clusterID}' 2>/dev/null)'")].spec.healthCheckIP}' 2>/dev/null | head -1)
+                -o jsonpath='{.items[?(@.metadata.labels.submariner-io/clusterID!="'"$(kubectl get submariner -n submariner-operator --kubeconfig="${KUBECONFIG1}" --context="${CLUSTER1_CONTEXT}" -o jsonpath='{.spec.clusterID}' 2>/dev/null)"'")].spec.healthCheckIP}' 2>/dev/null | head -1)
 
             if [ -n "$HEALTH_CHECK_IP_C1" ]; then
                 collect_ovnk_pinger_tcpdump "cluster1" "${KUBECONFIG1}" "${CLUSTER1_CONTEXT}" "${OUTPUT_DIR}/ovnk-pinger" "${HEALTH_CHECK_IP_C1}" &
@@ -1638,10 +1663,10 @@ if [[ "$CNI_CLUSTER1" == "OVNKubernetes" ]] || [[ "$CNI_CLUSTER2" == "OVNKuberne
 
         # Collect from cluster2 if it's OVN-K and pinger failed (Gateway OR RouteAgent)
         if [[ "$CNI_CLUSTER2" == "OVNKubernetes" ]] && \
-           ([ "$TUNNEL_STATUS_CLUSTER2" != "connected" ] || [ "$ROUTEAGENT_ERROR_C2" == "true" ]); then
+           { [ "$TUNNEL_STATUS_CLUSTER2" != "connected" ] || [ "$ROUTEAGENT_ERROR_C2" == "true" ]; }; then
             HEALTH_CHECK_IP_C2=$(kubectl get endpoints.submariner.io -n submariner-operator \
                 --kubeconfig="${KUBECONFIG2}" --context="${CLUSTER2_CONTEXT}" \
-                -o jsonpath='{.items[?(@.metadata.labels.submariner-io/clusterID!="'$(kubectl get submariner -n submariner-operator --kubeconfig="${KUBECONFIG2}" --context="${CLUSTER2_CONTEXT}" -o jsonpath='{.spec.clusterID}' 2>/dev/null)'")].spec.healthCheckIP}' 2>/dev/null | head -1)
+                -o jsonpath='{.items[?(@.metadata.labels.submariner-io/clusterID!="'"$(kubectl get submariner -n submariner-operator --kubeconfig="${KUBECONFIG2}" --context="${CLUSTER2_CONTEXT}" -o jsonpath='{.spec.clusterID}' 2>/dev/null)"'")].spec.healthCheckIP}' 2>/dev/null | head -1)
 
             if [ -n "$HEALTH_CHECK_IP_C2" ]; then
                 collect_ovnk_pinger_tcpdump "cluster2" "${KUBECONFIG2}" "${CLUSTER2_CONTEXT}" "${OUTPUT_DIR}/ovnk-pinger" "${HEALTH_CHECK_IP_C2}" &
@@ -1650,8 +1675,8 @@ if [[ "$CNI_CLUSTER1" == "OVNKubernetes" ]] || [[ "$CNI_CLUSTER2" == "OVNKuberne
         fi
 
         # Wait for both to complete
-        [ -n "$PID_OVNK1" ] && wait $PID_OVNK1
-        [ -n "$PID_OVNK2" ] && wait $PID_OVNK2
+        [ -n "$PID_OVNK1" ] && wait "$PID_OVNK1"
+        [ -n "$PID_OVNK2" ] && wait "$PID_OVNK2"
 
         # Check if any pcap files were collected
         OVNK_PCAP_COUNT=$(find "${OUTPUT_DIR}/ovnk-pinger" -name "*.pcap" 2>/dev/null | wc -l)
@@ -1730,7 +1755,7 @@ if [ "$TUNNEL_STATUS_CLUSTER1" != "connected" ] || [ "$TUNNEL_STATUS_CLUSTER2" !
         USING_UDP_ENCAP=true
         echo "  Cable driver: VxLAN (uses UDP encapsulation on port ${NATT_PORT_C1})"
     elif [ "$CABLE_DRIVER_C1" = "libreswan" ] || [ "$CABLE_DRIVER_C1" = "ipsec" ]; then
-        if [ "$FORCE_UDP_C1" = "true" ] || ( [ -n "$USING_IP_C1" ] && [ -n "$PRIVATE_IP_C1" ] && [ "$USING_IP_C1" != "$PRIVATE_IP_C1" ] ); then
+        if [ "$FORCE_UDP_C1" = "true" ] || { [ -n "$USING_IP_C1" ] && [ -n "$PRIVATE_IP_C1" ] && [ "$USING_IP_C1" != "$PRIVATE_IP_C1" ]; }; then
             USING_UDP_ENCAP=true
             echo "  Cable driver: IPSec with UDP encapsulation (NAT-T port ${NATT_PORT_C1})"
         else
@@ -1755,11 +1780,13 @@ fi
 # Run inter-cluster firewall diagnostics if conditions are met
 if [ "$RUN_FIREWALL_INTER_CLUSTER" = "true" ]; then
     echo ""
-    echo "Firewall Inter-Cluster Diagnostics:" >> "${OUTPUT_DIR}/manifest.txt"
-    echo "  Reason: Tunnel not connected + UDP encapsulation detected" >> "${OUTPUT_DIR}/manifest.txt"
-    echo "  Cable driver: ${CABLE_DRIVER_C1}" >> "${OUTPUT_DIR}/manifest.txt"
-    echo "  NAT-T port: ${NATT_PORT_C1}" >> "${OUTPUT_DIR}/manifest.txt"
-    echo "" >> "${OUTPUT_DIR}/manifest.txt"
+    {
+    echo "Firewall Inter-Cluster Diagnostics:"
+    echo "  Reason: Tunnel not connected + UDP encapsulation detected"
+    echo "  Cable driver: ${CABLE_DRIVER_C1}"
+    echo "  NAT-T port: ${NATT_PORT_C1}"
+    echo ""
+    } >> "${OUTPUT_DIR}/manifest.txt"
 
     # Use IMAGE_OVERRIDE variable if already set from verify section, otherwise use quay.io as default
     if [ -z "$IMAGE_OVERRIDE" ]; then
@@ -1833,9 +1860,11 @@ fi
 # Run intra-cluster firewall diagnostics for cluster1 (independent of cluster2)
 if [ "$RUN_FIREWALL_INTRA_CLUSTER1" = "true" ]; then
     echo ""
-    echo "Firewall Intra-Cluster Diagnostics (Cluster1):" >> "${OUTPUT_DIR}/manifest.txt"
-    echo "  Reason: CNI is ${CNI_CLUSTER1} (not OVNK)" >> "${OUTPUT_DIR}/manifest.txt"
-    echo "" >> "${OUTPUT_DIR}/manifest.txt"
+    {
+    echo "Firewall Intra-Cluster Diagnostics (Cluster1):"
+    echo "  Reason: CNI is ${CNI_CLUSTER1} (not OVNK)"
+    echo ""
+    } >> "${OUTPUT_DIR}/manifest.txt"
 
     collect_firewall_intra_cluster "cluster1" "${KUBECONFIG1}" "${CLUSTER1_CONTEXT}" "${OUTPUT_DIR}/firewall" "${FIREWALL_IMAGE_OVERRIDE}"
 fi
@@ -1843,9 +1872,11 @@ fi
 # Run intra-cluster firewall diagnostics for cluster2 (independent of cluster1)
 if [ "$RUN_FIREWALL_INTRA_CLUSTER2" = "true" ]; then
     echo ""
-    echo "Firewall Intra-Cluster Diagnostics (Cluster2):" >> "${OUTPUT_DIR}/manifest.txt"
-    echo "  Reason: CNI is ${CNI_CLUSTER2} (not OVNK)" >> "${OUTPUT_DIR}/manifest.txt"
-    echo "" >> "${OUTPUT_DIR}/manifest.txt"
+    {
+    echo "Firewall Intra-Cluster Diagnostics (Cluster2):"
+    echo "  Reason: CNI is ${CNI_CLUSTER2} (not OVNK)"
+    echo ""
+    } >> "${OUTPUT_DIR}/manifest.txt"
 
     collect_firewall_intra_cluster "cluster2" "${KUBECONFIG2}" "${CLUSTER2_CONTEXT}" "${OUTPUT_DIR}/firewall" "${FIREWALL_IMAGE_OVERRIDE}"
 fi
@@ -1873,27 +1904,29 @@ if [ "$TUNNEL_STATUS_CLUSTER1" != "connected" ] && [ "$TUNNEL_STATUS_CLUSTER2" !
     echo ""
 
     # Create skip notes for all verify files
-    echo "========================================" > "${OUTPUT_DIR}/verify/connectivity.txt"
-    echo "CONNECTIVITY VERIFICATION SKIPPED" >> "${OUTPUT_DIR}/verify/connectivity.txt"
-    echo "========================================" >> "${OUTPUT_DIR}/verify/connectivity.txt"
-    echo "" >> "${OUTPUT_DIR}/verify/connectivity.txt"
-    echo "Connectivity verification was skipped because tunnel status is not 'connected' on either cluster." >> "${OUTPUT_DIR}/verify/connectivity.txt"
-    echo "" >> "${OUTPUT_DIR}/verify/connectivity.txt"
-    echo "Tunnel status:" >> "${OUTPUT_DIR}/verify/connectivity.txt"
-    echo "  Cluster1: ${TUNNEL_STATUS_CLUSTER1}" >> "${OUTPUT_DIR}/verify/connectivity.txt"
-    echo "  Cluster2: ${TUNNEL_STATUS_CLUSTER2}" >> "${OUTPUT_DIR}/verify/connectivity.txt"
-    echo "" >> "${OUTPUT_DIR}/verify/connectivity.txt"
-    echo "Why skipped:" >> "${OUTPUT_DIR}/verify/connectivity.txt"
-    echo "  - Both tunnels are not connected - no connectivity possible" >> "${OUTPUT_DIR}/verify/connectivity.txt"
-    echo "  - Focus should be on establishing basic tunnel connectivity first" >> "${OUTPUT_DIR}/verify/connectivity.txt"
-    echo "  - tcpdump packet captures (if collected) provide better diagnostics for tunnel failures" >> "${OUTPUT_DIR}/verify/connectivity.txt"
-    echo "" >> "${OUTPUT_DIR}/verify/connectivity.txt"
-    echo "Recommended diagnostics for tunnel failures:" >> "${OUTPUT_DIR}/verify/connectivity.txt"
-    echo "  1. Check tcpdump/ directory for packet-level analysis" >> "${OUTPUT_DIR}/verify/connectivity.txt"
-    echo "  2. Review cluster*/subctl-diagnose-all.txt for health check results" >> "${OUTPUT_DIR}/verify/connectivity.txt"
-    echo "  3. Review cluster*/gather/cluster*/ipsec-status.log for IPsec tunnel state" >> "${OUTPUT_DIR}/verify/connectivity.txt"
-    echo "" >> "${OUTPUT_DIR}/verify/connectivity.txt"
-    echo "To run connectivity tests, fix the tunnel issue first, then re-collect diagnostics." >> "${OUTPUT_DIR}/verify/connectivity.txt"
+    {
+    echo "========================================"
+    echo "CONNECTIVITY VERIFICATION SKIPPED"
+    echo "========================================"
+    echo ""
+    echo "Connectivity verification was skipped because tunnel status is not 'connected' on either cluster."
+    echo ""
+    echo "Tunnel status:"
+    echo "  Cluster1: ${TUNNEL_STATUS_CLUSTER1}"
+    echo "  Cluster2: ${TUNNEL_STATUS_CLUSTER2}"
+    echo ""
+    echo "Why skipped:"
+    echo "  - Both tunnels are not connected - no connectivity possible"
+    echo "  - Focus should be on establishing basic tunnel connectivity first"
+    echo "  - tcpdump packet captures (if collected) provide better diagnostics for tunnel failures"
+    echo ""
+    echo "Recommended diagnostics for tunnel failures:"
+    echo "  1. Check tcpdump/ directory for packet-level analysis"
+    echo "  2. Review cluster*/subctl-diagnose-all.txt for health check results"
+    echo "  3. Review cluster*/gather/cluster*/ipsec-status.log for IPsec tunnel state"
+    echo ""
+    echo "To run connectivity tests, fix the tunnel issue first, then re-collect diagnostics."
+    } > "${OUTPUT_DIR}/verify/connectivity.txt"
 
     cp "${OUTPUT_DIR}/verify/connectivity.txt" "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
     cp "${OUTPUT_DIR}/verify/connectivity.txt" "${OUTPUT_DIR}/verify/service-discovery.txt"
@@ -1925,6 +1958,7 @@ if [ "$SKIP_VERIFY" = "false" ]; then
     # Use quay.io as default for upstream Submariner
     echo "Using quay.io/submariner/nettest:devel as default image..."
     IMAGE_OVERRIDE="--image-override submariner-nettest=quay.io/submariner/nettest:devel"
+    read -ra IMAGE_OVERRIDE_ARGS <<< "$IMAGE_OVERRIDE"
 
     # Merge kubeconfigs temporarily for subctl verify
     MERGED_KUBECONFIG="${OUTPUT_DIR}/merged-kubeconfig"
@@ -1940,11 +1974,13 @@ if [ "$SKIP_VERIFY" = "false" ]; then
     echo ""
 
     VERIFY_CMD="KUBECONFIG=${MERGED_KUBECONFIG} subctl verify --context ${CLUSTER1_CONTEXT} --tocontext ${CLUSTER2_CONTEXT} --only ${VERIFY_CONNECTIVITY_FLAG} --connection-timeout 50 --verbose ${IMAGE_OVERRIDE}"
-    echo "========================================" > "${OUTPUT_DIR}/verify/connectivity.txt"
-    echo "Command executed:" >> "${OUTPUT_DIR}/verify/connectivity.txt"
-    echo "${VERIFY_CMD}" >> "${OUTPUT_DIR}/verify/connectivity.txt"
-    echo "========================================" >> "${OUTPUT_DIR}/verify/connectivity.txt"
-    echo "" >> "${OUTPUT_DIR}/verify/connectivity.txt"
+    {
+    echo "========================================"
+    echo "Command executed:"
+    echo "${VERIFY_CMD}"
+    echo "========================================"
+    echo ""
+    } > "${OUTPUT_DIR}/verify/connectivity.txt"
 
     # Run verify in background with progress monitoring
     VERIFY_TIMEOUT=1800  # 30 minutes max
@@ -1957,7 +1993,7 @@ if [ "$SKIP_VERIFY" = "false" ]; then
             --tocontext "${CLUSTER2_CONTEXT}" \
             --only "${VERIFY_CONNECTIVITY_FLAG}" \
             --connection-timeout 50 \
-            --verbose ${IMAGE_OVERRIDE} \
+            --verbose "${IMAGE_OVERRIDE_ARGS[@]}" \
             >> "${OUTPUT_DIR}/verify/connectivity.txt" 2>&1
     ) &
     VERIFY_PID=$!
@@ -1986,7 +2022,7 @@ if [ "$SKIP_VERIFY" = "false" ]; then
             completed_tests=0
         fi
 
-        if [ "$completed_tests" -ge "$EARLY_STOP_THRESHOLD" 2>/dev/null ]; then
+        if [ "$completed_tests" -ge "$EARLY_STOP_THRESHOLD" ] 2>/dev/null; then
             # Check if tests have completed normally (final summary exists)
             if ! grep -q "^Ran.*Specs" "${OUTPUT_DIR}/verify/connectivity.txt" 2>/dev/null; then
                 # Tests still running - check if tests are failing
@@ -1997,9 +2033,11 @@ if [ "$SKIP_VERIFY" = "false" ]; then
                     echo "  ⚠ First $completed_tests tests failing - stopping early to save time"
                     echo "     (Collected enough diagnostic data to identify connectivity issues)"
                     kill $VERIFY_PID 2>/dev/null
-                    echo "" >> "${OUTPUT_DIR}/verify/connectivity.txt"
-                    echo "Verification stopped early after $completed_tests consecutive test failures" >> "${OUTPUT_DIR}/verify/connectivity.txt"
-                    echo "This indicates systemic connectivity issues - see failed test details above" >> "${OUTPUT_DIR}/verify/connectivity.txt"
+                    {
+                    echo ""
+                    echo "Verification stopped early after $completed_tests consecutive test failures"
+                    echo "This indicates systemic connectivity issues - see failed test details above"
+                    } >> "${OUTPUT_DIR}/verify/connectivity.txt"
                     break
                 fi
             fi
@@ -2032,17 +2070,19 @@ if [ "$SKIP_VERIFY" = "false" ]; then
         echo "  (Small packet test is only useful to detect MTU issues when large packets fail)"
         echo ""
 
-        echo "========================================" > "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
-        echo "SMALL PACKET TEST SKIPPED" >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
-        echo "========================================" >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
-        echo "" >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
-        echo "Small packet test was skipped because regular connectivity test passed." >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
-        echo "" >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
-        echo "The small packet test (--packet-size 400) is only useful to detect MTU/fragmentation" >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
-        echo "issues where large packets fail but small packets succeed. Since large packets are" >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
-        echo "already working, there is no need to test small packets." >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
-        echo "" >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
-        echo "Regular connectivity test result: PASSED" >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
+        {
+        echo "========================================"
+        echo "SMALL PACKET TEST SKIPPED"
+        echo "========================================"
+        echo ""
+        echo "Small packet test was skipped because regular connectivity test passed."
+        echo ""
+        echo "The small packet test (--packet-size 400) is only useful to detect MTU/fragmentation"
+        echo "issues where large packets fail but small packets succeed. Since large packets are"
+        echo "already working, there is no need to test small packets."
+        echo ""
+        echo "Regular connectivity test result: PASSED"
+        } > "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
 
         RUN_MTU_TEST=false
     fi
@@ -2055,11 +2095,13 @@ if [ "$SKIP_VERIFY" = "false" ]; then
         echo ""
 
         VERIFY_CMD="KUBECONFIG=${MERGED_KUBECONFIG} subctl verify --context ${CLUSTER1_CONTEXT} --tocontext ${CLUSTER2_CONTEXT} --only connectivity --connection-timeout 50 --verbose --packet-size 400 ${IMAGE_OVERRIDE}"
-        echo "========================================" > "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
-        echo "Command executed:" >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
-        echo "${VERIFY_CMD}" >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
-        echo "========================================" >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
-        echo "" >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
+        {
+        echo "========================================"
+        echo "Command executed:"
+        echo "${VERIFY_CMD}"
+        echo "========================================"
+        echo ""
+        } > "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
 
         # Run verify in background with progress monitoring
         (
@@ -2070,7 +2112,7 @@ if [ "$SKIP_VERIFY" = "false" ]; then
                 --connection-timeout 50 \
                 --verbose \
                 --packet-size 400 \
-                ${IMAGE_OVERRIDE} \
+                "${IMAGE_OVERRIDE_ARGS[@]}" \
                 >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt" 2>&1
         ) &
         VERIFY_PID=$!
@@ -2098,7 +2140,7 @@ if [ "$SKIP_VERIFY" = "false" ]; then
                 completed_tests=0
             fi
 
-            if [ "$completed_tests" -ge "$EARLY_STOP_THRESHOLD" 2>/dev/null ]; then
+            if [ "$completed_tests" -ge "$EARLY_STOP_THRESHOLD" ] 2>/dev/null; then
                 if ! grep -q "^Ran.*Specs" "${OUTPUT_DIR}/verify/connectivity-small-packet.txt" 2>/dev/null; then
                     failure_blocks=$(grep -c "FAIL\|timed out\|refused" "${OUTPUT_DIR}/verify/connectivity-small-packet.txt" 2>/dev/null || echo "0")
 
@@ -2106,9 +2148,11 @@ if [ "$SKIP_VERIFY" = "false" ]; then
                         echo "  ⚠ First $completed_tests MTU tests failing - stopping early to save time"
                         echo "     (Collected enough diagnostic data to identify MTU/packet size issues)"
                         kill $VERIFY_PID 2>/dev/null
-                        echo "" >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
-                        echo "Verification stopped early after $completed_tests consecutive test failures" >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
-                        echo "This indicates systemic connectivity issues - see failed test details above" >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
+                        {
+                        echo ""
+                        echo "Verification stopped early after $completed_tests consecutive test failures"
+                        echo "This indicates systemic connectivity issues - see failed test details above"
+                        } >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
                         break
                     fi
                 fi
@@ -2129,17 +2173,19 @@ if [ "$SKIP_VERIFY" = "false" ]; then
         # Only write skip message if file doesn't already exist (avoid overwriting earlier skip message)
         if [ ! -f "${OUTPUT_DIR}/verify/connectivity-small-packet.txt" ]; then
             echo "Skipping MTU test (tunnel connected on only one cluster)"
-            echo "========================================" > "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
-            echo "MTU TEST SKIPPED" >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
-            echo "========================================" >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
-            echo "" >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
-            echo "MTU test was skipped because tunnel is only connected on one cluster." >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
-            echo "" >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
-            echo "Tunnel status:" >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
-            echo "  Cluster1: ${TUNNEL_STATUS_CLUSTER1}" >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
-            echo "  Cluster2: ${TUNNEL_STATUS_CLUSTER2}" >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
-            echo "" >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
-            echo "MTU testing requires tunnel connected on both clusters." >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
+            {
+            echo "========================================"
+            echo "MTU TEST SKIPPED"
+            echo "========================================"
+            echo ""
+            echo "MTU test was skipped because tunnel is only connected on one cluster."
+            echo ""
+            echo "Tunnel status:"
+            echo "  Cluster1: ${TUNNEL_STATUS_CLUSTER1}"
+            echo "  Cluster2: ${TUNNEL_STATUS_CLUSTER2}"
+            echo ""
+            echo "MTU testing requires tunnel connected on both clusters."
+            } > "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
         fi
     fi
 
@@ -2157,11 +2203,13 @@ if [ "$SKIP_VERIFY" = "false" ]; then
         echo ""
 
         VERIFY_CMD="KUBECONFIG=${MERGED_KUBECONFIG} subctl verify --context ${CLUSTER1_CONTEXT} --tocontext ${CLUSTER2_CONTEXT} --only service-discovery --connection-timeout 50 --verbose ${IMAGE_OVERRIDE}"
-        echo "========================================" > "${OUTPUT_DIR}/verify/service-discovery.txt"
-        echo "Command executed:" >> "${OUTPUT_DIR}/verify/service-discovery.txt"
-        echo "${VERIFY_CMD}" >> "${OUTPUT_DIR}/verify/service-discovery.txt"
-        echo "========================================" >> "${OUTPUT_DIR}/verify/service-discovery.txt"
-        echo "" >> "${OUTPUT_DIR}/verify/service-discovery.txt"
+        {
+        echo "========================================"
+        echo "Command executed:"
+        echo "${VERIFY_CMD}"
+        echo "========================================"
+        echo ""
+        } > "${OUTPUT_DIR}/verify/service-discovery.txt"
 
         # Run verify in background with progress monitoring
         (
@@ -2171,7 +2219,7 @@ if [ "$SKIP_VERIFY" = "false" ]; then
                 --only service-discovery \
                 --connection-timeout 50 \
                 --verbose \
-                ${IMAGE_OVERRIDE} \
+                "${IMAGE_OVERRIDE_ARGS[@]}" \
                 >> "${OUTPUT_DIR}/verify/service-discovery.txt" 2>&1
         ) &
         VERIFY_PID=$!
@@ -2199,7 +2247,7 @@ if [ "$SKIP_VERIFY" = "false" ]; then
                 completed_tests=0
             fi
 
-            if [ "$completed_tests" -ge "$EARLY_STOP_THRESHOLD" 2>/dev/null ]; then
+            if [ "$completed_tests" -ge "$EARLY_STOP_THRESHOLD" ] 2>/dev/null; then
                 if ! grep -q "^Ran.*Specs" "${OUTPUT_DIR}/verify/service-discovery.txt" 2>/dev/null; then
                     failure_blocks=$(grep -c "FAIL\|timed out\|refused" "${OUTPUT_DIR}/verify/service-discovery.txt" 2>/dev/null || echo "0")
 
@@ -2207,9 +2255,11 @@ if [ "$SKIP_VERIFY" = "false" ]; then
                         echo "  ⚠ First $completed_tests service discovery tests failing - stopping early to save time"
                         echo "     (Collected enough diagnostic data to identify service discovery issues)"
                         kill $VERIFY_PID 2>/dev/null
-                        echo "" >> "${OUTPUT_DIR}/verify/service-discovery.txt"
-                        echo "Verification stopped early after $completed_tests consecutive test failures" >> "${OUTPUT_DIR}/verify/service-discovery.txt"
-                        echo "This indicates systemic service discovery issues - see failed test details above" >> "${OUTPUT_DIR}/verify/service-discovery.txt"
+                        {
+                        echo ""
+                        echo "Verification stopped early after $completed_tests consecutive test failures"
+                        echo "This indicates systemic service discovery issues - see failed test details above"
+                        } >> "${OUTPUT_DIR}/verify/service-discovery.txt"
                         break
                     fi
                 fi
@@ -2228,16 +2278,18 @@ if [ "$SKIP_VERIFY" = "false" ]; then
         echo "  End time: $(date '+%Y-%m-%d %H:%M:%S')"
     else
         echo "Skipping service-discovery verification (not enabled on either cluster)"
-        echo "========================================" > "${OUTPUT_DIR}/verify/service-discovery.txt"
-        echo "SERVICE DISCOVERY VERIFICATION SKIPPED" >> "${OUTPUT_DIR}/verify/service-discovery.txt"
-        echo "========================================" >> "${OUTPUT_DIR}/verify/service-discovery.txt"
-        echo "" >> "${OUTPUT_DIR}/verify/service-discovery.txt"
-        echo "Service discovery is not enabled on either cluster." >> "${OUTPUT_DIR}/verify/service-discovery.txt"
-        echo "" >> "${OUTPUT_DIR}/verify/service-discovery.txt"
-        echo "Cluster1 serviceDiscoveryEnabled: ${SD_ENABLED_CLUSTER1:-not set (defaults to false)}" >> "${OUTPUT_DIR}/verify/service-discovery.txt"
-        echo "Cluster2 serviceDiscoveryEnabled: ${SD_ENABLED_CLUSTER2:-not set (defaults to false)}" >> "${OUTPUT_DIR}/verify/service-discovery.txt"
-        echo "" >> "${OUTPUT_DIR}/verify/service-discovery.txt"
-        echo "To enable service discovery, see: https://submariner.io/getting-started/quickstart/openshift/service-discovery/" >> "${OUTPUT_DIR}/verify/service-discovery.txt"
+        {
+        echo "========================================"
+        echo "SERVICE DISCOVERY VERIFICATION SKIPPED"
+        echo "========================================"
+        echo ""
+        echo "Service discovery is not enabled on either cluster."
+        echo ""
+        echo "Cluster1 serviceDiscoveryEnabled: ${SD_ENABLED_CLUSTER1:-not set (defaults to false)}"
+        echo "Cluster2 serviceDiscoveryEnabled: ${SD_ENABLED_CLUSTER2:-not set (defaults to false)}"
+        echo ""
+        echo "To enable service discovery, see: https://submariner.io/getting-started/quickstart/openshift/service-discovery/"
+        } > "${OUTPUT_DIR}/verify/service-discovery.txt"
     fi
 
     # Check for OVNK-specific SNAT issue
@@ -2309,20 +2361,22 @@ if [ "$SKIP_VERIFY" = "false" ]; then
         echo ""
 
         VERIFY_CMD="KUBECONFIG=${MERGED_KUBECONFIG} subctl verify --context ${CLUSTER1_CONTEXT} --tocontext ${CLUSTER2_CONTEXT} --only connectivity --connection-timeout 50 --verbose --skip-src-ip-check ${IMAGE_OVERRIDE}"
-        echo "========================================" > "${OUTPUT_DIR}/verify/connectivity-skip-src-ip-check.txt"
-        echo "Command executed:" >> "${OUTPUT_DIR}/verify/connectivity-skip-src-ip-check.txt"
-        echo "${VERIFY_CMD}" >> "${OUTPUT_DIR}/verify/connectivity-skip-src-ip-check.txt"
-        echo "========================================" >> "${OUTPUT_DIR}/verify/connectivity-skip-src-ip-check.txt"
-        echo "" >> "${OUTPUT_DIR}/verify/connectivity-skip-src-ip-check.txt"
-        echo "CONTEXT: This test was run because:" >> "${OUTPUT_DIR}/verify/connectivity-skip-src-ip-check.txt"
-        echo "  - Regular connectivity tests: FAILED" >> "${OUTPUT_DIR}/verify/connectivity-skip-src-ip-check.txt"
-        echo "  - Small packet size tests: FAILED (rules out MTU issue)" >> "${OUTPUT_DIR}/verify/connectivity-skip-src-ip-check.txt"
-        echo "  - OVNK CNI detected (Cluster1: ${CNI_CLUSTER1}, Cluster2: ${CNI_CLUSTER2})" >> "${OUTPUT_DIR}/verify/connectivity-skip-src-ip-check.txt"
-        echo "  - Testing if known OVNK SNAT bug is the root cause" >> "${OUTPUT_DIR}/verify/connectivity-skip-src-ip-check.txt"
-        echo "" >> "${OUTPUT_DIR}/verify/connectivity-skip-src-ip-check.txt"
-        echo "If this test passes, it indicates the known OVNK SNAT issue documented at:" >> "${OUTPUT_DIR}/verify/connectivity-skip-src-ip-check.txt"
-        echo "https://github.com/submariner-io/submariner/issues/3307#issuecomment-2653220140" >> "${OUTPUT_DIR}/verify/connectivity-skip-src-ip-check.txt"
-        echo "" >> "${OUTPUT_DIR}/verify/connectivity-skip-src-ip-check.txt"
+        {
+        echo "========================================"
+        echo "Command executed:"
+        echo "${VERIFY_CMD}"
+        echo "========================================"
+        echo ""
+        echo "CONTEXT: This test was run because:"
+        echo "  - Regular connectivity tests: FAILED"
+        echo "  - Small packet size tests: FAILED (rules out MTU issue)"
+        echo "  - OVNK CNI detected (Cluster1: ${CNI_CLUSTER1}, Cluster2: ${CNI_CLUSTER2})"
+        echo "  - Testing if known OVNK SNAT bug is the root cause"
+        echo ""
+        echo "If this test passes, it indicates the known OVNK SNAT issue documented at:"
+        echo "https://github.com/submariner-io/submariner/issues/3307#issuecomment-2653220140"
+        echo ""
+        } > "${OUTPUT_DIR}/verify/connectivity-skip-src-ip-check.txt"
 
         # Run verify with --skip-src-ip-check
         (
@@ -2333,7 +2387,7 @@ if [ "$SKIP_VERIFY" = "false" ]; then
                 --connection-timeout 50 \
                 --verbose \
                 --skip-src-ip-check \
-                ${IMAGE_OVERRIDE} \
+                "${IMAGE_OVERRIDE_ARGS[@]}" \
                 >> "${OUTPUT_DIR}/verify/connectivity-skip-src-ip-check.txt" 2>&1
         ) &
         VERIFY_PID=$!
