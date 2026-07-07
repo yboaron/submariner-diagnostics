@@ -203,7 +203,53 @@ grep "reroute" <gateway-node>_ovn-nbctl-lr-policy-list.log
 grep "10.130.0.0/16" <gateway-node>_ovn-nbctl-lr-route-list.log
 ```
 
-### Step 5: Verify CRs Present (v0.16.0+)
+### Step 5: Verify OVN-K SNAT Exemptions (Gateway Node Only, Submariner 0.22+)
+
+**CRITICAL:** Only check the **gateway node** - non-gateway nodes don't need SNAT exemptions.
+
+**Why:** Submariner configures SNAT exemptions only on gateway nodes by design. Non-gateway
+nodes route Submariner traffic through table 150 to the gateway, so they don't need exemptions.
+
+**File needed:**
+- `<gateway-node>_nftables.log` (collected on Submariner 0.22+ deployments)
+
+**What to check:**
+
+Look for `mgmtport-no-snat-subnets-v4` set containing remote cluster CIDRs:
+
+```bash
+# Search for SNAT exemption set
+grep -A 10 "mgmtport-no-snat-subnets-v4" <gateway-node>_nftables.log
+```
+
+**Expected output:**
+```
+set mgmtport-no-snat-subnets-v4 {
+    type ipv4_addr
+    flags interval
+    elements = {
+        10.130.0.0/16,    # Remote cluster pod CIDR
+        100.67.0.0/16     # Remote cluster service CIDR
+    }
+}
+```
+
+**Verification:**
+- ✅ All remote cluster CIDRs (pod + service) should be in the set
+- ✅ Elements format: CIDR notation (e.g., 10.130.0.0/16)
+- ❌ **Missing CIDRs:** OVN-K will SNAT traffic to remote cluster → connectivity fails
+
+**If SNAT exemptions missing on gateway node:**
+1. Check Submariner version (requires 0.22+)
+2. Check gateway RouteAgent logs for OVN configuration errors
+3. Verify nftables is being used (not iptables)
+4. Contact Submariner community if configuration appears correct
+
+**Common mistake to AVOID:**
+- ❌ **Don't check non-gateway nodes** - they don't need SNAT exemptions
+- ❌ False positive: "SNAT exemptions missing on worker-1" when worker-1 is not the gateway
+
+### Step 6: Verify CRs Present (v0.16.0+)
 
 **Files:**
 - `cluster*/gather/cluster*/gatewayroutes_*.yaml`

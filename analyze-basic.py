@@ -3075,10 +3075,10 @@ class SubmarinerAnalyzer:
                         self._analyze_nftables_file(gateway_nft_file, cluster, gateway_node,
                                                     globalnet_enabled, is_gateway=True)
 
-            # Check OVN-K SNAT exemptions on all nodes if OVN-K
+            # Check OVN-K SNAT exemptions on gateway node if OVN-K
             cni = self.detect_cni(cluster)
-            if "OVN" in cni:
-                self._check_ovn_snat_exemptions(gather_dir, cluster)
+            if "OVN" in cni and gateway_node:
+                self._check_ovn_snat_exemptions(gather_dir, cluster, gateway_node)
 
     def _analyze_nftables_file(self, nft_file, cluster, node_name, globalnet_enabled, is_gateway=False):
         """Parse and analyze a single nftables file."""
@@ -3147,9 +3147,15 @@ class SubmarinerAnalyzer:
             if total_packets > 0:
                 self._print(f"    {Colors.OKGREEN}✓{Colors.ENDC} MSS clamping active ({total_packets} SYN packets clamped)")
 
-    def _check_ovn_snat_exemptions(self, gather_dir, cluster):
-        """Check OVN-K mgmtport SNAT exemptions for Submariner CIDRs on all nodes."""
+    def _check_ovn_snat_exemptions(self, gather_dir, cluster, gateway_node):
+        """Check OVN-K mgmtport SNAT exemptions for Submariner CIDRs on gateway node only.
+
+        Note: Submariner only configures SNAT exemptions on gateway nodes by design.
+        Non-gateway nodes route Submariner traffic through table 150 to the gateway,
+        so they don't need SNAT exemptions.
+        """
         self._print(f"\n    {Colors.BOLD}OVN-K SNAT Exemption Check:{Colors.ENDC}")
+        self._print(f"      Checking gateway node: {gateway_node}")
 
         # Get remote cluster CIDRs that should be exempted
         remote_cidrs = self._get_remote_cidrs(cluster)
@@ -3157,62 +3163,49 @@ class SubmarinerAnalyzer:
             self._print(f"      {Colors.WARNING}⚠{Colors.ENDC} No remote CIDRs found")
             return
 
-        self._print(f"      Checking CIDRs: {', '.join(remote_cidrs)}")
+        self._print(f"      Expected CIDRs: {', '.join(remote_cidrs)}")
 
-        # Find all nftables files (check all nodes, not just gateway)
-        nftables_files = glob.glob(os.path.join(gather_dir, "*_nftables.log"))
-        if not nftables_files:
-            self._print(f"      {Colors.WARNING}⚠{Colors.ENDC} No nftables files found")
+        # Check only the gateway node's nftables file
+        gateway_nft_file = os.path.join(gather_dir, f"{gateway_node}_nftables.log")
+
+        if not os.path.exists(gateway_nft_file):
+            self._print(f"      {Colors.WARNING}⚠{Colors.ENDC} Gateway nftables file not found")
             return
 
-        nodes_checked = 0
-        node_issues = {}
+        try:
+            with open(gateway_nft_file, encoding='utf-8') as f:
+                content = f.read()
+        except (OSError, UnicodeDecodeError) as e:
+            self._print(f"      {Colors.WARNING}⚠{Colors.ENDC} Failed to read gateway nftables: {e}")
+            return
 
-        for nft_file in nftables_files:
-            node_name = os.path.basename(nft_file).replace('_nftables.log', '')
+        # Find mgmtport-no-snat-subnets-v4 set
+        snat_exempt_match = re.search(
+            r'set mgmtport-no-snat-subnets-v4 \{[^}]*elements = \{([^}]+)\}',
+            content, re.DOTALL
+        )
 
-            try:
-                with open(nft_file, encoding='utf-8') as f:
-                    content = f.read()
-            except (OSError, UnicodeDecodeError):
-                continue
+        if not snat_exempt_match:
+            self._print(f"      {Colors.WARNING}⚠{Colors.ENDC} mgmtport-no-snat-subnets-v4 set not found")
+            self._print(f"      {Colors.OKBLUE}ℹ{Colors.ENDC} Note: Pre-nftables OVN-K versions don't use this set")
+            return
 
-            # Find mgmtport-no-snat-subnets-v4 set
-            snat_exempt_match = re.search(
-                r'set mgmtport-no-snat-subnets-v4 \{[^}]*elements = \{([^}]+)\}',
-                content, re.DOTALL
+        exempt_content = snat_exempt_match.group(1)
+
+        # Check each remote CIDR
+        missing_exemptions = []
+        for cidr in remote_cidrs:
+            if cidr not in exempt_content:
+                missing_exemptions.append(cidr)
+
+        if missing_exemptions:
+            self._print(f"      {Colors.FAIL}✗{Colors.ENDC} Missing exemptions: {', '.join(missing_exemptions)}")
+            self._print(f"      {Colors.FAIL}→{Colors.ENDC} OVN will SNAT Submariner traffic from gateway (breaks tunnel)")
+            self.issues.append(
+                f"{cluster}/{gateway_node}: Remote CIDRs not exempted from OVN mgmtport SNAT: {', '.join(missing_exemptions)}"
             )
-
-            if not snat_exempt_match:
-                # OVN-K set not found - treat as missing configuration
-                node_issues[node_name] = ["mgmtport-no-snat-subnets-v4 set not found"]
-                self._print(f"      {Colors.WARNING}⚠{Colors.ENDC} {node_name}: mgmtport-no-snat-subnets-v4 set not found")
-                continue
-
-            nodes_checked += 1
-            exempt_content = snat_exempt_match.group(1)
-
-            # Check each remote CIDR on this node
-            missing_exemptions = []
-            for cidr in remote_cidrs:
-                if cidr not in exempt_content:
-                    missing_exemptions.append(cidr)
-
-            if missing_exemptions:
-                node_issues[node_name] = missing_exemptions
-                self._print(f"      {Colors.FAIL}✗{Colors.ENDC} {node_name}: Missing exemptions: {', '.join(missing_exemptions)}")
-
-        if nodes_checked == 0 and not node_issues:
-            self._print(f"      {Colors.WARNING}⚠{Colors.ENDC} No OVN-K SNAT configuration found")
-        elif not node_issues:
-            self._print(f"      {Colors.OKGREEN}✓{Colors.ENDC} All {nodes_checked} node(s) have correct SNAT exemptions")
-
-        if node_issues:
-            for node_name, missing in node_issues.items():
-                self.issues.append(
-                    f"{cluster}/{node_name}: Remote CIDRs not exempted from OVN mgmtport SNAT: {', '.join(missing)}"
-                )
-            self._print(f"      {Colors.FAIL}→{Colors.ENDC} OVN will SNAT Submariner traffic (breaks tunnel)")
+        else:
+            self._print(f"      {Colors.OKGREEN}✓{Colors.ENDC} All remote CIDRs correctly exempted from OVN SNAT")
 
     def _get_remote_cidrs(self, cluster):
         """Get remote cluster CIDRs (pod + service + globalnet if enabled)."""
