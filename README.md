@@ -251,10 +251,138 @@ For airgap environments, ensure the following container image is mirrored to you
 - **`quay.io/submariner/nettest:devel`** - Used by several components in the collection script
   (firewall diagnostics, tcpdump collection, connectivity verification)
 
+## Self-Learning Diagnostic System
+
+**Help improve submariner-diagnostics by documenting the issues you investigate!**
+
+This repository includes an AI-powered self-learning system that automatically enhances both Python and Claude analyzers based on your investigations.
+
+### How It Works
+
+1. **Investigate** an issue using existing tools (manually or with analyzers)
+2. **Document** your findings through an AI-guided interview
+3. **Auto-generate** detection code and documentation
+4. **Contribute** via pull request
+
+### Prerequisites
+
+1. **Claude Code** - The workflows use Claude Code's workflow feature
+2. **Repository cloned** - Clone submariner-diagnostics repository
+3. **Navigate to repo** - Workflows are automatically available when in the repo directory
+
+```bash
+# Clone the repository
+git clone https://github.com/submariner-io/submariner-diagnostics.git
+cd submariner-diagnostics
+
+# Workflows in .claude/workflows/ are now automatically available!
+# No installation or copying needed - just use them
+```
+
+### Quick Start
+
+After investigating an issue and determining the root cause:
+
+```bash
+# Step 1: AI-guided interview to create case file
+/workflow learn-from-investigation
+
+# AI will ask you questions about:
+# - What diagnostic file you analyzed
+# - What the user reported
+# - What root cause you found
+# - Key indicators that led you to the conclusion
+# - How to fix it
+# - How to distinguish from similar issues
+
+# Output: cases/review/case-XXX.yaml
+
+# Step 2: Review the generated case file
+cat cases/review/case-XXX.yaml
+vim cases/review/case-XXX.yaml  # Edit if needed
+
+# Step 3: Auto-generate analyzer enhancements
+/workflow review-and-enhance-case cases/review/case-XXX.yaml
+
+# AI automatically:
+# ✓ Generates Python detection code
+# ✓ Updates Claude documentation
+# ✓ Creates test cases
+# ✓ Runs lint checks
+# ✓ Runs pytest
+# ✓ Tests on original diagnostic
+# ✓ Checks for regressions
+# ✓ Creates git branch
+# ✓ Prepares PR description
+#
+# Output: Branch ready to push!
+
+# Step 4: Push and create PR
+git push origin enhance/case-XXX
+gh pr create --fill
+# Or use GitHub web UI
+```
+
+### What Gets Generated
+
+From one documented investigation, the system automatically creates:
+
+- **Python detection function** - Added to `analyze-basic.py`
+- **Claude documentation** - Updated analysis guides in `docs/analysis/`
+- **Test cases** - pytest tests and test diagnostic files
+- **PR description** - Complete with verification summary
+
+### Benefits
+
+- **Knowledge preservation** - Every investigation becomes automated detection
+- **Consistent documentation** - Structured case files
+- **Growing test coverage** - Each case includes tests
+- **Self-improving** - Analyzers get smarter over time
+
+### Prerequisites
+
+```bash
+# Install development dependencies
+pip install pytest flake8 pylint black isort pyyaml
+npm install -g markdownlint-cli
+```
+
+### Documentation
+
+- [Learn From Investigation Workflow](.claude/workflows/learn-from-investigation.md)
+- [Review and Enhance Workflow](.claude/workflows/review-and-enhance-case.md)
+- [Case File Format](docs/case-file-format.md)
+- [Example Case](cases/examples/case-001-aws-missing-gateway-sg.yaml)
+
+### Validation
+
+Validate a case file before enhancement:
+
+```bash
+./bin/validate-case.sh cases/review/case-XXX.yaml
+```
+
+Or using Make:
+
+```bash
+make -f Makefile.local validate-case CASE=cases/review/case-XXX.yaml
+```
+
 ## Contributing
 
 Contributions welcome! Please submit issues or PRs to:
 <https://github.com/submariner-io/submariner-diagnostics>
+
+### Development Tasks
+
+Local development tasks are available in `Makefile.local`:
+
+```bash
+make -f Makefile.local help        # Show all available tasks
+make -f Makefile.local lint        # Run all lint checks
+make -f Makefile.local test        # Run pytest
+make -f Makefile.local verify      # Run all checks
+```
 
 ## Support
 

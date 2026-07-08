@@ -4,3 +4,16 @@
 Makefile.dapper
 Makefile.shipyard
 Dockerfile.*
+
+# Self-learning system work-in-progress
+cases/review/
+pr-description-*.md
+
+# Python cache
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Test coverage
+.coverage
+htmlcov/
