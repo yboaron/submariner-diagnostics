@@ -111,7 +111,7 @@ When `--sanitize` is used:
 
 ### 2. Analyze (Basic - No AI)
 
-#### Quick Analysis (for Engineers)
+#### Quick Analysis
 
 **Option 1: No Clone Required (Easiest)**
 
@@ -358,10 +358,166 @@ For airgap environments, ensure the following container image is mirrored to you
 - **`quay.io/submariner/nettest:devel`** - Used by several components in the collection script
   (firewall diagnostics, tcpdump collection, connectivity verification)
 
+## Self-Learning Diagnostic System
+
+**Help improve submariner-diagnostics by documenting the issues you investigate!**
+
+This repository includes an AI-powered self-learning system that automatically enhances both Python and Claude analyzers
+based on your investigations.
+
+**Every investigation you document becomes automated detection for the entire community.**
+
+When you investigate a Submariner issue and find the root cause, spend 10 minutes documenting it through our AI-guided
+workflow. The system will automatically generate detection code, tests, and documentation - turning your one-time
+investigation into permanent value for everyone.
+
+You review the generated code, create a pull request, and maintainers review before merging. It's an easy way to
+contribute meaningful improvements to the project!
+
+### When to Use This
+
+Use the self-learning workflow whenever you:
+- Manually investigated an issue and found the root cause
+- Fixed a customer issue that wasn't automatically detected
+- Discovered a new failure pattern or misconfiguration
+- Want to help others avoid the same debugging effort
+
+### How It Works
+
+1. **Investigate** an issue using existing tools (manually or with analyzers)
+2. **Document** your findings through an AI-guided interview
+3. **Auto-generate** detection code and documentation
+4. **Review** the generated code and tests
+5. **Create PR** for community review and contribution
+
+### Prerequisites
+
+1. **Claude Code** - The workflows use Claude Code's workflow feature
+2. **Repository cloned** - Clone submariner-diagnostics repository
+3. **Navigate to repo** - Workflows are automatically available when in the repo directory
+
+```bash
+# Clone the repository
+git clone https://github.com/submariner-io/submariner-diagnostics.git
+cd submariner-diagnostics
+
+# Workflows in .claude/workflows/ are now automatically available!
+# No installation or copying needed - just use them
+```
+
+### Quick Start
+
+After investigating an issue and determining the root cause:
+
+```bash
+# Step 1: AI-guided interview to create case file
+/workflow learn-from-investigation
+
+# AI will ask you questions about:
+# - What diagnostic file you analyzed
+# - What the user reported
+# - What root cause you found
+# - Key indicators that led you to the conclusion
+# - How to fix it
+# - How to distinguish from similar issues
+
+# Output: cases/case-XXX.yaml
+
+# Step 2: Review the generated case file
+cat cases/case-XXX.yaml
+vim cases/case-XXX.yaml  # Edit if needed
+
+# Step 3: Auto-generate analyzer enhancements
+/workflow review-and-enhance-case cases/case-XXX.yaml
+
+# AI automatically:
+# ✓ Generates Python detection code
+# ✓ Updates Claude documentation
+# ✓ Creates test cases
+# ✓ Runs lint checks
+# ✓ Runs pytest
+# ✓ Tests on original diagnostic
+# ✓ Checks for regressions
+# ✓ Creates git branch
+# ✓ Prepares PR description
+#
+# Output: Branch ready to push!
+
+# Step 4: Review generated changes
+git diff main..enhance/case-XXX
+# Review all generated files:
+# - analyze-basic.py (detection code)
+# - docs/analysis/*.md (Claude documentation)
+# - tests/ (test cases and diagnostics)
+
+# Step 5: Push and create PR (for manual review)
+git push origin enhance/case-XXX
+gh pr create --fill
+# Or use GitHub web UI
+
+# Your PR will be reviewed by maintainers before merging
+```
+
+### What Gets Generated
+
+From one documented investigation, the system automatically creates:
+
+- **Python detection function** - Added to `analyze-basic.py`
+- **Claude documentation** - Updated analysis guides in `docs/analysis/`
+- **Test cases** - pytest tests and test diagnostic files
+- **PR description** - Complete with verification summary
+
+### Benefits
+
+- **Knowledge preservation** - Every investigation becomes automated detection
+- **Consistent documentation** - Structured case files
+- **Growing test coverage** - Each case includes tests
+- **Self-improving** - Analyzers get smarter over time
+
+### Prerequisites
+
+```bash
+# Install development dependencies
+pip install pytest flake8 pylint black isort pyyaml
+npm install -g markdownlint-cli
+```
+
+### Documentation
+
+- [Learn From Investigation Workflow](.claude/workflows/learn-from-investigation.md)
+- [Review and Enhance Workflow](.claude/workflows/review-and-enhance-case.md)
+- [Case File Format](docs/workflows/case-file-format.md)
+- [Example Case](docs/workflows/examples/case-001-aws-missing-gateway-sg.yaml)
+
+### Validation
+
+Validate a case file before enhancement:
+
+```bash
+./bin/validate-case.sh cases/case-XXX.yaml
+```
+
+Or using Make:
+
+```bash
+make -f Makefile.local validate-case CASE=cases/case-XXX.yaml
+```
+
 ## Contributing
 
 Contributions welcome! Please submit issues or PRs to:
 <https://github.com/submariner-io/submariner-diagnostics>
+
+### Development Tasks
+
+Local development tasks are available in `Makefile.local`:
+
+```bash
+make -f Makefile.local help        # Show all available tasks
+make -f Makefile.local lint        # Run all lint checks
+make -f Makefile.local test        # Run pytest
+make -f Makefile.local verify      # Run all checks
+```
 
 ## Support
 

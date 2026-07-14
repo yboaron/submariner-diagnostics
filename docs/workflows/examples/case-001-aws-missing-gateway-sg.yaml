@@ -1,0 +1,241 @@
+# Example Submariner Diagnostic Case File
+#
+# PURPOSE: Documentation only - shows the complete case file format with all possible fields
+# This does NOT add AWS detection to the analyzers - it's a reference example
+#
+# Use this as a template when creating your own case files after investigating issues
+
+metadata:
+  case_id: "001-aws-gateway-missing-security-group"
+  created_date: "2026-07-08"
+  confidence: "high"
+
+issue:
+  complaint: "Gateway pod failing with sendmsg: operation not permitted"
+  symptoms:
+    - tunnel_not_connected
+    - pod_crashloop
+
+root_cause:
+  summary: "Manually tagged AWS worker node missing required security group configuration"
+  explanation: |
+    When a user manually tags an existing worker node with submariner.io/gateway=true,
+    it bypasses ACM's cloud-prepare automation which normally creates dedicated gateway
+    nodes with proper AWS infrastructure setup.
+
+    The manually tagged node only has the standard worker security group, which blocks
+    IPsec traffic (UDP/500, UDP/4500, ESP protocol 50). Additionally, the node may not
+    have a public IP address if it's in a private subnet.
+
+    ACM's cloud-prepare would have created:
+    - Dedicated gateway security group with IPsec rules
+    - Gateway node in public subnet
+    - Public IP address assignment
+
+  category: "deployment_method"
+  issue_type: "misconfiguration"
+
+  # No bug_info since this is not a software bug
+
+  platform_specific: "aws"
+
+indicators:
+  required:
+    - name: "Gateway sendmsg error"
+      file_location: "cluster1/gather/submariner-operator/pods/submariner-gateway-*/logs.txt"
+      actual_path: "cluster1/gather/submariner-operator/pods/submariner-gateway-5d8f9-abcd/logs.txt"
+      pattern: "sendmsg: operation not permitted"
+      regex: "FATAL.*sendmsg: operation not permitted"
+      significance: "Gateway pod cannot send IPsec packets due to network permissions"
+      excerpt: |
+        2026/07/07 11:48:03 Pinger for 10.138.0.2 started
+        2026/07/07 11:48:04 FATAL: sending packet: write ip 0.0.0.0->10.138.0.2: sendmsg: operation not permitted
+        2026/07/07 11:48:04 Pinger for 10.138.0.2 stopped
+
+    - name: "Invalid source IP"
+      file_location: "cluster1/gather/submariner-operator/pods/submariner-gateway-*/logs.txt"
+      actual_path: "cluster1/gather/submariner-operator/pods/submariner-gateway-5d8f9-abcd/logs.txt"
+      pattern: "write ip 0.0.0.0->"
+      regex: "write ip 0\\.0\\.0\\.0->\\d+\\.\\d+\\.\\d+\\.\\d+"
+      significance: "Node has no valid source IP - missing public IP or in wrong subnet"
+      excerpt: |
+        2026/07/07 11:48:04 FATAL: sending packet: write ip 0.0.0.0->10.138.0.2: sendmsg: operation not permitted
+
+  optional:
+    - name: "NAT discovery timeout"
+      file_location: "cluster1/gather/submariner-operator/pods/submariner-gateway-*/logs.txt"
+      actual_path: "cluster1/gather/submariner-operator/pods/submariner-gateway-5d8f9-abcd/logs.txt"
+      pattern: "NAT discovery"
+      regex: "NAT.*discovery.*(timeout|failed)"
+      significance: "UDP/4490 port blocked by security group - NAT discovery cannot complete"
+
+    - name: "ACM managed deployment"
+      file_location: "cluster1/acm-addons.txt"
+      actual_path: "cluster1/acm-addons.txt"
+      pattern: "submariner-addon"
+      significance: "ACM deployment should have used automated gateway creation"
+
+  detection_logic:
+    pseudo_code: |
+      def detect_aws_gateway_missing_sg(diagnostic_data):
+          """
+          Detects AWS gateway node missing security group configuration.
+
+          Confidence scoring:
+          - sendmsg error (required): 40 points
+          - Source IP 0.0.0.0 (required): 30 points
+          - NAT discovery timeout (optional): 20 points
+          - ACM deployment (optional): 10 points
+          Threshold: 70+ points for detection
+          """
+          confidence = 0
+          findings = []
+
+          # Check required: sendmsg error
+          gateway_logs = read_gateway_logs(diagnostic_data)
+          if not gateway_logs:
+              return None
+
+          if "sendmsg: operation not permitted" in gateway_logs:
+              confidence += 40
+              findings.append("Gateway sendmsg error detected")
+          else:
+              return None  # Required indicator missing
+
+          # Check required: invalid source IP
+          if re.search(r"write ip 0\.0\.0\.0->", gateway_logs):
+              confidence += 30
+              findings.append("Invalid source IP (0.0.0.0)")
+          else:
+              return None  # Required indicator missing
+
+          # Check optional: NAT discovery timeout
+          if re.search(r"NAT.*discovery.*(timeout|failed)", gateway_logs):
+              confidence += 20
+              findings.append("NAT discovery timeout")
+
+          # Check optional: ACM deployment
+          if is_acm_deployment(diagnostic_data):
+              confidence += 10
+              findings.append("ACM-managed deployment")
+
+          # Determine confidence level
+          if confidence >= 80:
+              conf_level = "high"
+          elif confidence >= 70:
+              conf_level = "medium"
+          elif confidence >= 60:
+              conf_level = "low"
+          else:
+              return None  # Below threshold (< 60)
+
+          return {
+              "issue_id": "001-aws-gateway-missing-security-group",
+              "confidence": conf_level,
+              "confidence_score": confidence,
+              "findings": findings
+          }
+
+    confidence_thresholds:
+      high: 80
+      medium: 70
+      low: 60
+
+    scoring_rules: |
+      Required indicators (must have both):
+      - sendmsg error: 40 points
+      - Source IP 0.0.0.0: 30 points
+
+      Optional indicators (boost confidence):
+      - NAT discovery timeout: +20 points
+      - ACM deployment: +10 points
+
+      Total possible: 100 points
+      Minimum for detection: 70 points
+
+remediation:
+  solutions:
+    - type: "permanent_fix"
+      name: "Enable LoadBalancer mode via ACM"
+      description: |
+        Configure Submariner to use Kubernetes LoadBalancer service instead of
+        requiring dedicated gateway nodes with cloud-specific configuration.
+        This bypasses the need for cloud-prepare entirely.
+
+      steps:
+        - description: "Patch SubmarinerConfig on ACM Hub cluster"
+          command: "oc patch submarinerconfig submariner -n <managed-cluster-name> --type=merge -p '{\"spec\":{\"loadBalancerEnable\":true}}'"
+          context: "Run on ACM Hub cluster"
+          expected_output: "submarinerconfig.submarineraddon.open-cluster-management.io/submariner patched"
+
+        - description: "Verify LoadBalancer service created"
+          command: "oc get svc -n submariner-operator | grep LoadBalancer"
+          context: "Run on managed cluster"
+          expected_output: "submariner-gateway   LoadBalancer   10.X.X.X   a1b2c3...elb.amazonaws.com"
+
+      verification:
+        - "Check gateway pod logs - NAT discovery should succeed"
+        - "Verify AWS NLB created: aws elbv2 describe-load-balancers --region <region>"
+        - "Check tunnel status: subctl show connections"
+        - "Test connectivity: subctl verify connectivity"
+
+      expected_duration: "2-5 minutes"
+
+      when_to_use: "Recommended for all cases where manual node tagging was used"
+
+    - type: "permanent_fix"
+      name: "Re-deploy using ACM automated gateway creation"
+      description: |
+        Remove manual label and let ACM create dedicated gateway nodes with
+        proper cloud infrastructure configuration.
+
+      steps:
+        - description: "Remove manual gateway label"
+          command: "oc label node <node-name> submariner.io/gateway-"
+          context: "Run on managed cluster"
+
+        - description: "Configure Submariner via ACM console"
+          command: "ACM Console → Clusters → <cluster> → Add-ons → Submariner → Set gateway count to 1"
+          context: "ACM Web UI"
+
+      verification:
+        - "Verify new gateway node created"
+        - "Check gateway node has both security groups"
+        - "Verify tunnel connects successfully"
+
+      expected_duration: "10-15 minutes (includes node creation)"
+
+      caveats:
+        - "May fail with 'reservations not found' error on some cluster configurations"
+        - "Creates additional node (cost increase)"
+        - "Requires available capacity in cluster"
+
+      when_to_use: "When dedicated gateway nodes are preferred and cluster supports automated creation"
+
+false_positives:
+  - similar_symptom: "sendmsg: operation not permitted with non-zero source IP"
+    actual_different_cause: "SELinux or AppArmor blocking network operations"
+    how_to_distinguish: "Check source IP in error message - if NOT 0.0.0.0, check audit logs for policy denials"
+
+  - similar_symptom: "NAT discovery timeout on OpenStack"
+    actual_different_cause: "UDP port 4490 conflict with OpenStack metadata service"
+    how_to_distinguish: "Check platform - if OpenStack, see special-cases.md for UDP port conflict"
+
+related_information:
+  platform: "aws"
+  affected_versions:
+    acm: "all"
+    submariner: "all"
+    ocp: "all"
+
+diagnostic_file:
+  path: "submariner-diagnostics-20260707-093439.tar.gz"
+  analyzed: true
+
+analysis_notes: |
+  This is a common mistake when users try to work around cloud-prepare failures.
+  The "reservations not found" error (GitHub issue #1203) often leads users to
+  manually tag nodes instead of using LoadBalancer mode.
+
+  Key learning: The 0.0.0.0 source IP was the critical indicator that this was
+  a node configuration issue rather than infrastructure blocking.

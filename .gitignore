@@ -6,3 +6,15 @@ Makefile.shipyard
 Dockerfile.*
 __pycache__/
 submariner-diagnostics-*/
+
+# Self-learning system work-in-progress
+cases/
+pr-description-*.md
+
+# Python cache
+*.pyc
+.pytest_cache/
+
+# Test coverage
+.coverage
+htmlcov/

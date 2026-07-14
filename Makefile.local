@@ -1,0 +1,87 @@
+# Local development Makefile for submariner-diagnostics
+# For linting, testing, and validation
+
+.PHONY: lint lint-python lint-shell lint-markdown format-python test validate-case help
+
+# Python linting
+lint-python:
+	@echo "Running Python linting..."
+	@python3 -m flake8 analyze-basic.py --max-line-length=120
+	@python3 -m pylint analyze-basic.py --max-line-length=120
+	@echo "Checking Python formatting..."
+	@python3 -m black --check analyze-basic.py
+
+# Shell linting
+lint-shell:
+	@echo "Running shellcheck..."
+	@shellcheck collect-full-diagnostics.sh bin/*.sh
+
+# Markdown linting
+lint-markdown:
+	@echo "Running markdown linting..."
+	@markdownlint docs/**/*.md .claude/workflows/*.md README.md CLAUDE.md --ignore node_modules
+
+# All linting
+lint: lint-python lint-shell lint-markdown
+	@echo "All lint checks complete"
+
+# Fix Python formatting
+format-python:
+	@echo "Formatting Python code..."
+	@python3 -m black analyze-basic.py
+	@python3 -m isort analyze-basic.py
+	@echo "Python code formatted"
+
+# Run all tests
+test:
+	@echo "Running pytest..."
+	@python3 -m pytest tests/ -v
+
+# Validate a case file
+validate-case:
+	@if [ -z "$(CASE)" ]; then \
+		echo "Usage: make validate-case CASE=cases/review/case-XXX.yaml"; \
+		exit 1; \
+	fi
+	@./bin/validate-case.sh $(CASE)
+
+# Full verification (what CI should run)
+verify: lint test
+	@echo "✓ All verification passed!"
+
+# Install development dependencies
+install-dev-deps:
+	@echo "Installing Python development dependencies..."
+	@pip install pytest flake8 pylint black isort pyyaml
+	@echo "Installing Node.js development dependencies..."
+	@npm install -g markdownlint-cli
+	@echo "✓ Development dependencies installed"
+
+# Help
+help:
+	@echo "Submariner Diagnostics - Local Development Tasks"
+	@echo ""
+	@echo "Linting:"
+	@echo "  make lint              - Run all lint checks"
+	@echo "  make lint-python       - Run Python linting (flake8, pylint, black)"
+	@echo "  make lint-shell        - Run shellcheck on shell scripts"
+	@echo "  make lint-markdown     - Run markdownlint on documentation"
+	@echo ""
+	@echo "Formatting:"
+	@echo "  make format-python     - Auto-format Python code with black and isort"
+	@echo ""
+	@echo "Testing:"
+	@echo "  make test              - Run pytest test suite"
+	@echo "  make validate-case     - Validate a case file"
+	@echo "                           Usage: make validate-case CASE=cases/review/case-XXX.yaml"
+	@echo ""
+	@echo "Verification:"
+	@echo "  make verify            - Run all checks (lint + test)"
+	@echo ""
+	@echo "Setup:"
+	@echo "  make install-dev-deps  - Install development dependencies"
+	@echo ""
+	@echo "Self-Learning Workflows:"
+	@echo "  See .claude/workflows/ for AI-powered enhancement workflows"
+	@echo "  - learn-from-investigation.md"
+	@echo "  - review-and-enhance-case.md"
