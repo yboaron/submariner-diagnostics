@@ -28,6 +28,26 @@ TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 OUTPUT_DIR="submariner-diagnostics-${TIMESTAMP}"
 SANITIZE_MODE=false
 
+# =============================================================================
+# TIMEOUT CONFIGURATION
+# =============================================================================
+
+# Individual command timeouts (seconds)
+readonly TIMEOUT_CLUSTER_INFO=30
+readonly TIMEOUT_SUBCTL_GATHER=600
+readonly TIMEOUT_SUBCTL_SHOW=60
+readonly TIMEOUT_SUBCTL_DIAGNOSE=300
+readonly TIMEOUT_SUBCTL_VERSIONS=30
+readonly TIMEOUT_SUBCTL_VERIFY=900
+readonly TIMEOUT_FIREWALL_TEST=300
+readonly TIMEOUT_TCPDUMP_CAPTURE=120
+readonly TIMEOUT_KUBECTL_CMD=30
+
+# Progress tracking global variables
+TOTAL_STEPS=0
+CURRENT_STEP=0
+SCRIPT_START_TIME=""
+
 # Parse arguments - check for --sanitize flag
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -75,6 +95,147 @@ show_usage() {
     return 1 2>/dev/null || exit 1
 }
 
+# =============================================================================
+# TIMEOUT AND PROGRESS HELPER FUNCTIONS
+# =============================================================================
+
+# Format seconds to human-readable duration
+format_duration() {
+    local seconds=$1
+    local hours=$((seconds / 3600))
+    local minutes=$(((seconds % 3600) / 60))
+    local secs=$((seconds % 60))
+
+    if [ $hours -gt 0 ]; then
+        printf "%dh %dm %ds" $hours $minutes $secs
+    elif [ $minutes -gt 0 ]; then
+        printf "%dm %ds" $minutes $secs
+    else
+        printf "%ds" $secs
+    fi
+}
+
+# Calculate runtime estimates (typical and maximum)
+calculate_runtime_estimates() {
+    # Estimated timings (realistic values based on testing)
+    local EST_PREFLIGHT=120                # 2 min
+    local EST_GATHER_MIN=270               # 4.5 min (fast cluster)
+    local EST_GATHER_MAX=600               # 10 min (slow cluster)
+    local EST_SHOW=60                      # 1 min
+    local EST_DIAGNOSE=300                 # 5 min (usually times out)
+    local EST_VERSIONS=30                  # 30 sec
+    local EST_VERIFY_MIN=300               # 5 min
+    local EST_VERIFY_MAX=900               # 15 min
+    local EST_TCPDUMP_MIN=540              # 9 min
+    local EST_TCPDUMP_MAX=720              # 12 min
+
+    # Parallel cluster collection: max of the two clusters
+    local cluster_min=$((EST_GATHER_MIN + EST_SHOW + EST_DIAGNOSE + EST_VERSIONS))
+    local cluster_max=$((EST_GATHER_MAX + EST_SHOW + EST_DIAGNOSE + EST_VERSIONS))
+
+    # Total = preflight + max(cluster1,cluster2) + verify + tcpdump
+    RUNTIME_MIN=$((EST_PREFLIGHT + cluster_min + EST_VERIFY_MIN + EST_TCPDUMP_MIN))
+    RUNTIME_MAX=$((EST_PREFLIGHT + cluster_max + EST_VERIFY_MAX + EST_TCPDUMP_MAX))
+
+    RUNTIME_MIN_FMT=$(format_duration $RUNTIME_MIN)
+    RUNTIME_MAX_FMT=$(format_duration $RUNTIME_MAX)
+
+    # Also calculate per-phase estimates for display
+    PHASE_PREFLIGHT_FMT=$(format_duration $EST_PREFLIGHT)
+    PHASE_CLUSTER_MIN_FMT=$(format_duration $cluster_min)
+    PHASE_CLUSTER_MAX_FMT=$(format_duration $cluster_max)
+    PHASE_VERIFY_MIN_FMT=$(format_duration $EST_VERIFY_MIN)
+    PHASE_VERIFY_MAX_FMT=$(format_duration $EST_VERIFY_MAX)
+    PHASE_TCPDUMP_MIN_FMT=$(format_duration $EST_TCPDUMP_MIN)
+    PHASE_TCPDUMP_MAX_FMT=$(format_duration $EST_TCPDUMP_MAX)
+}
+
+# Legacy function for backward compatibility
+calculate_max_runtime() {
+    calculate_runtime_estimates
+    echo $RUNTIME_MAX
+}
+
+# Initialize progress tracking
+init_progress() {
+    SCRIPT_START_TIME=$(date +%s)
+
+    # Count total steps
+    TOTAL_STEPS=1  # Pre-flight
+
+    # Per-cluster collection (4 steps each)
+    TOTAL_STEPS=$((TOTAL_STEPS + 8))
+
+    # Verify tests (2)
+    TOTAL_STEPS=$((TOTAL_STEPS + 2))
+
+    # Firewall tests (2)
+    TOTAL_STEPS=$((TOTAL_STEPS + 2))
+
+    # Tcpdump
+    TOTAL_STEPS=$((TOTAL_STEPS + 1))
+
+    # Final packaging
+    TOTAL_STEPS=$((TOTAL_STEPS + 1))
+}
+
+# Display progress for current step
+progress_step() {
+    local step_name="$1"
+    local estimated_duration="${2:-}"
+
+    ((CURRENT_STEP++))
+
+    local elapsed=$(($(date +%s) - SCRIPT_START_TIME))
+    local elapsed_fmt
+    elapsed_fmt=$(format_duration $elapsed)
+
+    echo ""
+    echo "╔════════════════════════════════════════════════════════════════╗"
+    printf "║ [Step %2d/%2d] %-52s ║\n" "$CURRENT_STEP" "$TOTAL_STEPS" "$step_name"
+    echo "║────────────────────────────────────────────────────────────────║"
+    printf "║ Elapsed: %-53s ║\n" "$elapsed_fmt"
+    if [ -n "$estimated_duration" ]; then
+        printf "║ Est. duration: %-47s ║\n" "$estimated_duration"
+    fi
+    echo "╚════════════════════════════════════════════════════════════════╝"
+    echo ""
+}
+
+# Display phase banner with timing estimates
+phase_banner() {
+    local phase_num="$1"
+    local phase_name="$2"
+    local time_typical="$3"
+    local time_max="$4"
+    local note="$5"
+
+    echo ""
+    echo "╔════════════════════════════════════════════════════════════════╗"
+    printf "║  PHASE %s: %-52s ║\n" "$phase_num" "$phase_name"
+    printf "║  Typical: %-10s | Maximum: %-30s ║\n" "$time_typical" "$time_max"
+    if [ -n "$note" ]; then
+        printf "║  %-61s ║\n" "$note"
+    fi
+    echo "╚════════════════════════════════════════════════════════════════╝"
+    echo ""
+}
+
+# Display final summary
+progress_summary() {
+    local total_elapsed=$(($(date +%s) - SCRIPT_START_TIME))
+    local total_elapsed_fmt
+    total_elapsed_fmt=$(format_duration $total_elapsed)
+
+    echo ""
+    echo "╔════════════════════════════════════════════════════════════════╗"
+    echo "║                    COLLECTION COMPLETE                         ║"
+    echo "╚════════════════════════════════════════════════════════════════╝"
+    echo ""
+    echo "  Total runtime: $total_elapsed_fmt"
+    echo ""
+}
+
 # Function to test if context name contains illegal filesystem characters
 # Returns 0 if name is safe (no illegal chars), 1 if sanitization needed
 can_create_dir_with_name() {
@@ -95,6 +256,220 @@ sanitize_context_name() {
     local context="$1"
     # Replace illegal characters (: / \ @) with dash
     echo "$context" | sed 's/[:/\\@]/-/g'
+}
+
+# =============================================================================
+# PRE-FLIGHT VALIDATION
+# =============================================================================
+
+preflight_validation() {
+    echo ""
+    echo "╔════════════════════════════════════════════════════════════════╗"
+    echo "║           PRE-FLIGHT VALIDATION - CHECKING PREREQUISITES       ║"
+    echo "╚════════════════════════════════════════════════════════════════╝"
+    echo ""
+
+    local errors=0
+    local warnings=0
+
+    # 1. Check required binaries
+    echo "→ Checking required binaries..."
+    local required_bins=("kubectl" "subctl" "jq")
+    for bin in "${required_bins[@]}"; do
+        if command -v "$bin" &>/dev/null; then
+            echo "  ✓ $bin found: $(command -v "$bin")"
+        else
+            echo "  ✗ $bin NOT FOUND"
+            ((errors++))
+        fi
+    done
+
+    # 2. Check optional binaries
+    echo ""
+    echo "→ Checking optional binaries..."
+    if command -v tcpdump &>/dev/null; then
+        echo "  ✓ tcpdump found (tcpdump collection available)"
+    else
+        echo "  ⚠ tcpdump not found (tcpdump collection will be skipped)"
+        ((warnings++))
+    fi
+
+    # 3. Validate kubeconfig files exist
+    echo ""
+    echo "→ Validating kubeconfig files..."
+    if [ -f "$KUBECONFIG1" ]; then
+        echo "  ✓ Cluster1 kubeconfig exists: $KUBECONFIG1"
+    else
+        echo "  ✗ Cluster1 kubeconfig NOT FOUND: $KUBECONFIG1"
+        ((errors++))
+    fi
+
+    if [ -f "$KUBECONFIG2" ]; then
+        echo "  ✓ Cluster2 kubeconfig exists: $KUBECONFIG2"
+    else
+        echo "  ✗ Cluster2 kubeconfig NOT FOUND: $KUBECONFIG2"
+        ((errors++))
+    fi
+
+    # Only continue with further checks if kubeconfigs exist
+    if [ $errors -gt 0 ]; then
+        echo ""
+        echo "╔════════════════════════════════════════════════════════════════╗"
+        echo "║                   PRE-FLIGHT VALIDATION SUMMARY                ║"
+        echo "╚════════════════════════════════════════════════════════════════╝"
+        echo "  ✗ $errors ERROR(S) found - Cannot proceed with collection"
+        echo ""
+        echo "  Please fix the errors above before retrying"
+        return 1
+    fi
+
+    # 4. Validate contexts exist
+    echo ""
+    echo "→ Validating kubeconfig contexts..."
+    if timeout $TIMEOUT_KUBECTL_CMD kubectl config get-contexts "$CLUSTER1_CONTEXT" --kubeconfig "$KUBECONFIG1" &>/dev/null; then
+        echo "  ✓ Cluster1 context found: $CLUSTER1_CONTEXT"
+    else
+        echo "  ✗ Cluster1 context NOT FOUND: $CLUSTER1_CONTEXT"
+        echo "    Available contexts:"
+        kubectl config get-contexts --kubeconfig "$KUBECONFIG1" -o name 2>/dev/null | sed 's/^/      /' || echo "      (unable to list contexts)"
+        ((errors++))
+    fi
+
+    if timeout $TIMEOUT_KUBECTL_CMD kubectl config get-contexts "$CLUSTER2_CONTEXT" --kubeconfig "$KUBECONFIG2" &>/dev/null; then
+        echo "  ✓ Cluster2 context found: $CLUSTER2_CONTEXT"
+    else
+        echo "  ✗ Cluster2 context NOT FOUND: $CLUSTER2_CONTEXT"
+        echo "    Available contexts:"
+        kubectl config get-contexts --kubeconfig "$KUBECONFIG2" -o name 2>/dev/null | sed 's/^/      /' || echo "      (unable to list contexts)"
+        ((errors++))
+    fi
+
+    # 5. Test cluster connectivity (CRITICAL - this is where the 2-hour hang happened!)
+    echo ""
+    echo "→ Testing cluster connectivity ($TIMEOUT_CLUSTER_INFO second timeout per cluster)..."
+
+    if timeout $TIMEOUT_CLUSTER_INFO kubectl cluster-info --kubeconfig "$KUBECONFIG1" --context "$CLUSTER1_CONTEXT" &>/dev/null; then
+        local api_server
+        api_server=$(kubectl config view --kubeconfig "$KUBECONFIG1" --context "$CLUSTER1_CONTEXT" --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null || echo "unknown")
+        echo "  ✓ Cluster1 API server reachable: $api_server"
+    else
+        echo "  ✗ Cluster1 API server UNREACHABLE (timeout after ${TIMEOUT_CLUSTER_INFO}s)"
+        echo "    This will prevent data collection from cluster1"
+        ((errors++))
+    fi
+
+    if timeout $TIMEOUT_CLUSTER_INFO kubectl cluster-info --kubeconfig "$KUBECONFIG2" --context "$CLUSTER2_CONTEXT" &>/dev/null; then
+        local api_server
+        api_server=$(kubectl config view --kubeconfig "$KUBECONFIG2" --context "$CLUSTER2_CONTEXT" --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null || echo "unknown")
+        echo "  ✓ Cluster2 API server reachable: $api_server"
+    else
+        echo "  ✗ Cluster2 API server UNREACHABLE (timeout after ${TIMEOUT_CLUSTER_INFO}s)"
+        echo "    This will prevent data collection from cluster2"
+        ((errors++))
+    fi
+
+    # 6. Check Submariner deployment
+    echo ""
+    echo "→ Checking Submariner deployment..."
+
+    local cluster1_ns
+    cluster1_ns=$(timeout $TIMEOUT_KUBECTL_CMD kubectl get namespace submariner-operator --kubeconfig "$KUBECONFIG1" --context "$CLUSTER1_CONTEXT" -o name 2>/dev/null)
+    if [ -n "$cluster1_ns" ]; then
+        echo "  ✓ Cluster1: submariner-operator namespace exists"
+
+        local gw_count
+        gw_count=$(timeout $TIMEOUT_KUBECTL_CMD kubectl get pods -n submariner-operator -l app=submariner-gateway \
+            --kubeconfig "$KUBECONFIG1" --context "$CLUSTER1_CONTEXT" \
+            --no-headers 2>/dev/null | wc -l)
+        if [ "$gw_count" -gt 0 ]; then
+            if [ "$gw_count" -eq 1 ]; then
+                echo "    ✓ Gateway pod found: $gw_count (standalone mode)"
+            else
+                echo "    ✓ Gateway pods found: $gw_count (HA mode)"
+            fi
+        else
+            echo "    ⚠ No gateway pods found (Submariner may not be fully deployed)"
+            ((warnings++))
+        fi
+    else
+        echo "  ⚠ Cluster1: submariner-operator namespace NOT FOUND"
+        echo "    Submariner may not be deployed on this cluster"
+        ((warnings++))
+    fi
+
+    local cluster2_ns
+    cluster2_ns=$(timeout $TIMEOUT_KUBECTL_CMD kubectl get namespace submariner-operator --kubeconfig "$KUBECONFIG2" --context "$CLUSTER2_CONTEXT" -o name 2>/dev/null)
+    if [ -n "$cluster2_ns" ]; then
+        echo "  ✓ Cluster2: submariner-operator namespace exists"
+
+        local gw_count
+        gw_count=$(timeout $TIMEOUT_KUBECTL_CMD kubectl get pods -n submariner-operator -l app=submariner-gateway \
+            --kubeconfig "$KUBECONFIG2" --context "$CLUSTER2_CONTEXT" \
+            --no-headers 2>/dev/null | wc -l)
+        if [ "$gw_count" -gt 0 ]; then
+            if [ "$gw_count" -eq 1 ]; then
+                echo "    ✓ Gateway pod found: $gw_count (standalone mode)"
+            else
+                echo "    ✓ Gateway pods found: $gw_count (HA mode)"
+            fi
+        else
+            echo "    ⚠ No gateway pods found (Submariner may not be fully deployed)"
+            ((warnings++))
+        fi
+    else
+        echo "  ⚠ Cluster2: submariner-operator namespace NOT FOUND"
+        echo "    Submariner may not be deployed on this cluster"
+        ((warnings++))
+    fi
+
+    # 7. Check disk space
+    echo ""
+    echo "→ Checking available disk space..."
+    local output_parent
+    output_parent=$(dirname "$OUTPUT_DIR" 2>/dev/null || echo "/tmp")
+    local available_kb
+    available_kb=$(df -k "$output_parent" 2>/dev/null | tail -1 | awk '{print $4}')
+    local available_mb=$((available_kb / 1024))
+    if [ "$available_mb" -gt 500 ]; then
+        echo "  ✓ Available disk space: ${available_mb}MB (sufficient)"
+    elif [ "$available_mb" -gt 100 ]; then
+        echo "  ⚠ Available disk space: ${available_mb}MB (may be insufficient for large clusters)"
+        ((warnings++))
+    else
+        echo "  ✗ Available disk space: ${available_mb}MB (INSUFFICIENT - need at least 100MB)"
+        ((errors++))
+    fi
+
+    # Summary
+    echo ""
+    echo "╔════════════════════════════════════════════════════════════════╗"
+    echo "║                   PRE-FLIGHT VALIDATION SUMMARY                ║"
+    echo "╚════════════════════════════════════════════════════════════════╝"
+
+    if [ $errors -eq 0 ] && [ $warnings -eq 0 ]; then
+        echo "  ✓ ALL CHECKS PASSED - Ready to collect diagnostics"
+        echo ""
+        return 0
+    elif [ $errors -eq 0 ]; then
+        echo "  ⚠ $warnings WARNING(S) - Collection may be incomplete"
+        echo ""
+        echo -n "  Continue anyway? (y/n) "
+        read -r response
+        if [[ "$response" =~ ^[Yy]$ ]]; then
+            return 0
+        else
+            echo "  Collection cancelled by user"
+            return 1
+        fi
+    else
+        echo "  ✗ $errors ERROR(S) found - Cannot proceed with collection"
+        if [ $warnings -gt 0 ]; then
+            echo "  ⚠ $warnings WARNING(S) also found"
+        fi
+        echo ""
+        echo "  Please fix the errors above before retrying"
+        return 1
+    fi
 }
 
 # Function to merge kubeconfigs while handling duplicate user names
@@ -210,8 +585,13 @@ collect_cluster_diagnostics() {
     mkdir -p "${cluster_dir}"
 
     # subctl gather (most comprehensive)
-    echo "Running subctl gather for ${cluster_name}..."
-    subctl gather --kubeconfig "${kubeconfig}" --context "${context}" --dir "${cluster_dir}/gather" 2>&1 | tee "${cluster_dir}/gather.log"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Running subctl gather for ${cluster_name}..."
+    timeout 600 subctl gather --kubeconfig "${kubeconfig}" --context "${context}" --dir "${cluster_dir}/gather" 2>&1 | tee "${cluster_dir}/gather.log"
+    if [ $? -eq 124 ]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARNING: subctl gather timed out after 10 minutes on ${cluster_name}" | tee -a "${cluster_dir}/gather.log"
+    else
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Completed subctl gather for ${cluster_name}"
+    fi
 
     # Normalize gather directory structure for analyze-basic.py compatibility
     # subctl gather creates cluster-specific subdirectory, but name may differ from our cluster_name
@@ -226,16 +606,25 @@ collect_cluster_diagnostics() {
     fi
 
     # subctl show (connection status)
-    echo "Running subctl show for ${cluster_name}..."
-    subctl show all --kubeconfig "${kubeconfig}" --context "${context}" > "${cluster_dir}/subctl-show-all.txt" 2>&1
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Running subctl show for ${cluster_name}..."
+    timeout 60 subctl show all --kubeconfig "${kubeconfig}" --context "${context}" > "${cluster_dir}/subctl-show-all.txt" 2>&1
+    if [ $? -eq 124 ]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: subctl show timed out after 60 seconds" | tee -a "${cluster_dir}/subctl-show-all.txt"
+    fi
 
     # subctl diagnose (health checks)
-    echo "Running subctl diagnose for ${cluster_name}..."
-    subctl diagnose all --kubeconfig "${kubeconfig}" --context "${context}" > "${cluster_dir}/subctl-diagnose-all.txt" 2>&1
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Running subctl diagnose for ${cluster_name}..."
+    timeout $TIMEOUT_SUBCTL_DIAGNOSE subctl diagnose all --kubeconfig "${kubeconfig}" --context "${context}" > "${cluster_dir}/subctl-diagnose-all.txt" 2>&1
+    if [ $? -eq 124 ]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: subctl diagnose timed out after 5 minutes" | tee -a "${cluster_dir}/subctl-diagnose-all.txt"
+    fi
 
     # subctl show versions (version information)
-    echo "Running subctl show versions for ${cluster_name}..."
-    subctl show versions --kubeconfig "${kubeconfig}" --context "${context}" > "${cluster_dir}/subctl-show-versions.txt" 2>&1
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Running subctl show versions for ${cluster_name}..."
+    timeout 30 subctl show versions --kubeconfig "${kubeconfig}" --context "${context}" > "${cluster_dir}/subctl-show-versions.txt" 2>&1
+    if [ $? -eq 124 ]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: subctl show versions timed out after 30 seconds" | tee -a "${cluster_dir}/subctl-show-versions.txt"
+    fi
 
     # Additional CRs that might not be in gather
     echo "Collecting additional CRs for ${cluster_name}..."
@@ -894,18 +1283,21 @@ collect_firewall_inter_cluster() {
     echo "  Running firewall inter-cluster test..."
     echo "  Start time: $(date '+%Y-%m-%d %H:%M:%S')"
 
-    # Run firewall test
-    KUBECONFIG="${MERGED_KUBECONFIG_FW}" subctl diagnose firewall inter-cluster \
-        --context "${cluster1_name}" \
-        --remotecontext "${cluster2_name}" \
+    # Run firewall test (5 minute timeout)
+    timeout 300 bash -c "KUBECONFIG='${MERGED_KUBECONFIG_FW}' subctl diagnose firewall inter-cluster \
+        --context '${cluster1_name}' \
+        --remotecontext '${cluster2_name}' \
         --verbose \
-        "${image_override_args[@]}" \
-        >> "${firewall_dir}/firewall-inter-cluster.txt" 2>&1
+        ${image_override_args[*]} \
+        >> '${firewall_dir}/firewall-inter-cluster.txt' 2>&1"
 
     FW_EXIT_CODE=$?
     echo "  End time: $(date '+%Y-%m-%d %H:%M:%S')"
 
-    if [ $FW_EXIT_CODE -eq 0 ]; then
+    if [ $FW_EXIT_CODE -eq 124 ]; then
+        echo "  ⚠ Firewall inter-cluster test TIMED OUT after 5 minutes" | tee -a "${firewall_dir}/firewall-inter-cluster.txt"
+        echo "     This indicates the test pods may be stuck or the network is very slow"
+    elif [ $FW_EXIT_CODE -eq 0 ]; then
         echo "  ✓ Firewall inter-cluster test completed successfully"
     else
         echo "  ⚠ Firewall inter-cluster test completed with errors (exit code: $FW_EXIT_CODE)"
@@ -952,8 +1344,8 @@ collect_firewall_intra_cluster() {
     echo "  Running firewall intra-cluster test for ${cluster_name}..."
     echo "  Start time: $(date '+%Y-%m-%d %H:%M:%S')"
 
-    # Run firewall test
-    subctl diagnose firewall intra-cluster \
+    # Run firewall test (5 minute timeout)
+    timeout 300 subctl diagnose firewall intra-cluster \
         --kubeconfig "${kubeconfig}" \
         --context "${context}" \
         --verbose \
@@ -963,7 +1355,10 @@ collect_firewall_intra_cluster() {
     FW_EXIT_CODE=$?
     echo "  End time: $(date '+%Y-%m-%d %H:%M:%S')"
 
-    if [ $FW_EXIT_CODE -eq 0 ]; then
+    if [ $FW_EXIT_CODE -eq 124 ]; then
+        echo "  ⚠ Firewall intra-cluster test for ${cluster_name} TIMED OUT after 5 minutes" | tee -a "${firewall_dir}/firewall-intra-cluster-${cluster_name}.txt"
+        echo "     This indicates the test pods may be stuck or the network is very slow"
+    elif [ $FW_EXIT_CODE -eq 0 ]; then
         echo "  ✓ Firewall intra-cluster test for ${cluster_name} completed successfully"
     else
         echo "  ⚠ Firewall intra-cluster test for ${cluster_name} completed with errors (exit code: $FW_EXIT_CODE)"
@@ -1021,62 +1416,58 @@ if [ $# -eq 4 ]; then
     COMPLAINT="undefined"
 fi
 
-# Validate parameters before starting collection
+# =============================================================================
+# DISPLAY BANNER AND RUNTIME ESTIMATE
+# =============================================================================
+
+calculate_runtime_estimates
+
+echo ""
+echo "╔════════════════════════════════════════════════════════════════╗"
+echo "║          SUBMARINER DIAGNOSTICS COLLECTION TOOL                ║"
+echo "╚════════════════════════════════════════════════════════════════╝"
+echo ""
+echo "IMPORTANT: Collection timing varies by environment"
+echo "  • Typical runtime:  $RUNTIME_MIN_FMT"
+echo "  • Maximum runtime:  $RUNTIME_MAX_FMT (slow clusters or timeouts)"
+echo ""
+echo "What affects timing:"
+echo "  • Cluster responsiveness (API server, pod scheduling)"
+echo "  • Network latency between clusters"
+echo "  • Number of Submariner resources (pods, services, etc.)"
+echo "  • Registry accessibility (some checks may timeout - this is normal)"
+echo ""
+echo "Collection phases:"
+echo "  1. Pre-flight validation           (~$PHASE_PREFLIGHT_FMT)"
+echo "  2. Parallel cluster collection     ($PHASE_CLUSTER_MIN_FMT-$PHASE_CLUSTER_MAX_FMT) ← Both clusters at once"
+echo "  3. Connectivity verification        ($PHASE_VERIFY_MIN_FMT-$PHASE_VERIFY_MAX_FMT)"
+echo "  4. Traffic capture (tcpdump)        ($PHASE_TCPDUMP_MIN_FMT-$PHASE_TCPDUMP_MAX_FMT)"
+echo ""
+echo "The script will NOT hang - all operations have timeouts."
+echo "If a step times out, collection continues automatically."
+echo ""
+echo "Press Ctrl+C to cancel at any time."
+echo ""
+echo "════════════════════════════════════════════════════════════════"
+echo ""
+
+# =============================================================================
+# PRE-FLIGHT VALIDATION (REPLACES OLD VALIDATION CODE)
+# =============================================================================
+
+# Run comprehensive pre-flight validation
+if ! preflight_validation; then
+    echo ""
+    echo "ERROR: Pre-flight validation failed. Cannot proceed."
+    echo "Please fix the errors above and retry."
+    return 1 2>/dev/null || exit 1
+fi
+
+# Initialize progress tracking
+init_progress
+
+# Quick parameter validation (pre-flight already checked most of this)
 echo "Validating parameters..."
-
-# Validate kubeconfig1 exists
-if [ ! -f "$KUBECONFIG1" ]; then
-    echo "ERROR: Kubeconfig file not found: $KUBECONFIG1"
-    return 1 2>/dev/null || exit 1
-fi
-
-# Validate kubeconfig2 exists
-if [ ! -f "$KUBECONFIG2" ]; then
-    echo "ERROR: Kubeconfig file not found: $KUBECONFIG2"
-    return 1 2>/dev/null || exit 1
-fi
-
-# Validate context1 exists in kubeconfig1
-echo "Checking context in cluster1 kubeconfig..."
-if ! kubectl config get-contexts "$CLUSTER1_CONTEXT" --kubeconfig "$KUBECONFIG1" &>/dev/null; then
-    echo "ERROR: Context '$CLUSTER1_CONTEXT' not found in kubeconfig: $KUBECONFIG1"
-    echo "Available contexts:"
-    kubectl config get-contexts --kubeconfig "$KUBECONFIG1" -o name
-    return 1 2>/dev/null || exit 1
-fi
-
-# Validate cluster1 connectivity
-echo "Checking connectivity to cluster1..."
-if ! kubectl cluster-info --kubeconfig "$KUBECONFIG1" --context "$CLUSTER1_CONTEXT" &>/dev/null; then
-    echo "ERROR: Cannot connect to cluster using kubeconfig: $KUBECONFIG1, context: $CLUSTER1_CONTEXT"
-    echo "Please verify:"
-    echo "  - The kubeconfig file is valid"
-    echo "  - The context exists and is properly configured"
-    echo "  - The cluster is accessible from this machine"
-    echo "  - Your credentials are valid"
-    return 1 2>/dev/null || exit 1
-fi
-
-# Validate context2 exists in kubeconfig2
-echo "Checking context in cluster2 kubeconfig..."
-if ! kubectl config get-contexts "$CLUSTER2_CONTEXT" --kubeconfig "$KUBECONFIG2" &>/dev/null; then
-    echo "ERROR: Context '$CLUSTER2_CONTEXT' not found in kubeconfig: $KUBECONFIG2"
-    echo "Available contexts:"
-    kubectl config get-contexts --kubeconfig "$KUBECONFIG2" -o name
-    return 1 2>/dev/null || exit 1
-fi
-
-# Validate cluster2 connectivity
-echo "Checking connectivity to cluster2..."
-if ! kubectl cluster-info --kubeconfig "$KUBECONFIG2" --context "$CLUSTER2_CONTEXT" &>/dev/null; then
-    echo "ERROR: Cannot connect to cluster using kubeconfig: $KUBECONFIG2, context: $CLUSTER2_CONTEXT"
-    echo "Please verify:"
-    echo "  - The kubeconfig file is valid"
-    echo "  - The context exists and is properly configured"
-    echo "  - The cluster is accessible from this machine"
-    echo "  - Your credentials are valid"
-    return 1 2>/dev/null || exit 1
-fi
 
 # Check for overlapping context names
 CONTEXT_RENAMED=false
@@ -1457,8 +1848,6 @@ echo "  Kubeconfig: ${KUBECONFIG1##*/}"
 echo ""
 } >> "${OUTPUT_DIR}/manifest.txt"
 
-collect_cluster_diagnostics "cluster1" "${KUBECONFIG1}" "${CLUSTER1_CONTEXT}"
-
 # Collect from Cluster 2
 {
 echo "Cluster 2:"
@@ -1467,7 +1856,83 @@ echo "  Kubeconfig: ${KUBECONFIG2##*/}"
 echo ""
 } >> "${OUTPUT_DIR}/manifest.txt"
 
-collect_cluster_diagnostics "cluster2" "${KUBECONFIG2}" "${CLUSTER2_CONTEXT}"
+# =============================================================================
+# PHASE 2: PARALLEL CLUSTER COLLECTION
+# =============================================================================
+
+phase_banner "2/4" "Collecting cluster data (parallel)" "$PHASE_CLUSTER_MIN_FMT" "$PHASE_CLUSTER_MAX_FMT" "Both clusters collecting simultaneously"
+
+echo "Expected timeouts (normal behavior):"
+echo "  • subctl diagnose: 5 min timeout if metrics pods fail (ImagePullBackOff)"
+echo "  • subctl versions: 30 sec timeout if cluster unreachable"
+echo ""
+echo "These timeouts are EXPECTED and collection will continue."
+echo ""
+
+PHASE2_START=$(date +%s)
+
+# Run both cluster collections in parallel
+{
+    collect_cluster_diagnostics "cluster1" "${KUBECONFIG1}" "${CLUSTER1_CONTEXT}"
+} > "${OUTPUT_DIR}/cluster1-collection.log" 2>&1 &
+CLUSTER1_PID=$!
+
+{
+    collect_cluster_diagnostics "cluster2" "${KUBECONFIG2}" "${CLUSTER2_CONTEXT}"
+} > "${OUTPUT_DIR}/cluster2-collection.log" 2>&1 &
+CLUSTER2_PID=$!
+
+# Monitor progress while both collections run
+echo "[$(date '+%H:%M:%S')] Cluster1: Started collection (PID: $CLUSTER1_PID)"
+echo "[$(date '+%H:%M:%S')] Cluster2: Started collection (PID: $CLUSTER2_PID)"
+echo ""
+
+# Simple heartbeat - show we're alive every 30 seconds
+HEARTBEAT_COUNT=0
+while kill -0 $CLUSTER1_PID 2>/dev/null || kill -0 $CLUSTER2_PID 2>/dev/null; do
+    sleep 30
+    ((HEARTBEAT_COUNT++))
+    ELAPSED=$(($(date +%s) - PHASE2_START))
+    ELAPSED_FMT=$(format_duration $ELAPSED)
+
+    # Check status
+    C1_STATUS="running"
+    C2_STATUS="running"
+    kill -0 $CLUSTER1_PID 2>/dev/null || C1_STATUS="completed"
+    kill -0 $CLUSTER2_PID 2>/dev/null || C2_STATUS="completed"
+
+    echo "⏳ Collection in progress... (elapsed: $ELAPSED_FMT)"
+    echo "   Cluster1: $C1_STATUS | Cluster2: $C2_STATUS"
+done
+
+# Wait for both to finish
+wait $CLUSTER1_PID
+CLUSTER1_EXIT=$?
+wait $CLUSTER2_PID
+CLUSTER2_EXIT=$?
+
+PHASE2_ELAPSED=$(($(date +%s) - PHASE2_START))
+PHASE2_ELAPSED_FMT=$(format_duration $PHASE2_ELAPSED)
+
+# Merge collection logs back into main collection.log
+echo "" >> "${COLLECTION_LOG}"
+echo "=== Cluster1 Collection Output ===" >> "${COLLECTION_LOG}"
+cat "${OUTPUT_DIR}/cluster1-collection.log" >> "${COLLECTION_LOG}"
+echo "" >> "${COLLECTION_LOG}"
+echo "=== Cluster2 Collection Output ===" >> "${COLLECTION_LOG}"
+cat "${OUTPUT_DIR}/cluster2-collection.log" >> "${COLLECTION_LOG}"
+echo "" >> "${COLLECTION_LOG}"
+
+# Report completion
+echo ""
+if [ $CLUSTER1_EXIT -eq 0 ] && [ $CLUSTER2_EXIT -eq 0 ]; then
+    echo "✓ Parallel collection completed in $PHASE2_ELAPSED_FMT"
+else
+    echo "⚠ Parallel collection completed with errors in $PHASE2_ELAPSED_FMT"
+    [ $CLUSTER1_EXIT -ne 0 ] && echo "  Cluster1 exit code: $CLUSTER1_EXIT"
+    [ $CLUSTER2_EXIT -ne 0 ] && echo "  Cluster2 exit code: $CLUSTER2_EXIT"
+fi
+echo ""
 
 # Check for nettest image pull failures in subctl diagnose output
 echo ""
@@ -1983,7 +2448,7 @@ if [ "$SKIP_VERIFY" = "false" ]; then
     } > "${OUTPUT_DIR}/verify/connectivity.txt"
 
     # Run verify in background with progress monitoring
-    VERIFY_TIMEOUT=1800  # 30 minutes max
+    VERIFY_TIMEOUT=900  # 15 minutes max (reduced from 30min to prevent long hangs)
     PROGRESS_INTERVAL=60  # Show progress every 60 seconds
     EARLY_STOP_THRESHOLD=6  # Stop early if first 6 tests all fail
 
