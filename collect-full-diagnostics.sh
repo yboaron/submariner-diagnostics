@@ -651,7 +651,7 @@ collect_tcpdump_from_cluster() {
     local kubeconfig="$2"
     local context="$3"
     local tcpdump_dir="$4"
-    local capture_duration="${5:-30}"
+    local capture_duration="${5:-60}"  # Increased from 30s to 60s for better health check capture
 
     echo "=== Collecting tcpdump from ${cluster_name} gateway nodes ==="
 

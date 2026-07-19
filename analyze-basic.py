@@ -45,11 +45,72 @@ class SubmarinerAnalyzer:
         self.network_topology = {}  # Store network topology analysis
         self.collection_errors = []  # Track collection-time errors
         self.collection_failed = False  # Flag if collection had critical errors
+        self.cable_driver = None  # Cable driver (libreswan, vxlan, wireguard)
+
+        # Tunnel diagnostics data collection (for correlation analysis)
+        # Phase 1: Collect evidence from A (logs), B (datapath config), C (tcpdump)
+        # Phase 2: Correlate across sources and compare cluster1 vs cluster2
+        # Phase 3: Report conclusions based on correlated evidence
+        self.tunnel_diagnostics = {
+            'cluster1': {
+                'dnat_counters': {},       # B: GlobalNet health check DNAT counters
+                'routes': {},              # B: Routing table analysis
+                'ip_rules': {},            # B: IP rules analysis
+                'tcpdump_stats': {},       # C: Packet flow statistics
+                'icmp_unreachable': [],    # C: ICMP unreachable messages
+                'logs_errors': []          # A: Relevant log errors
+            },
+            'cluster2': {
+                'dnat_counters': {},
+                'routes': {},
+                'ip_rules': {},
+                'tcpdump_stats': {},
+                'icmp_unreachable': [],
+                'logs_errors': []
+            }
+        }
 
     def _print(self, *args, **kwargs):
         """Print only in terminal mode, suppress in slack mode"""
         if self.output_format == 'terminal':
             print(*args, **kwargs)
+
+    def find_files_recursive(self, base_dir, pattern, max_depth=4):
+        """
+        Recursively find files matching pattern in base_dir up to max_depth.
+
+        Args:
+            base_dir: Starting directory for search
+            pattern: Glob pattern (e.g., "gateways_*.yaml", "*_nftables.log")
+            max_depth: Maximum directory depth to search (default 4)
+
+        Returns:
+            List of absolute file paths matching pattern
+        """
+        matches = []
+
+        def search(directory, depth):
+            if depth > max_depth or not os.path.exists(directory):
+                return
+
+            try:
+                # Check current directory for matching files
+                for item in os.listdir(directory):
+                    item_path = os.path.join(directory, item)
+
+                    if os.path.isfile(item_path):
+                        # Check if file matches pattern
+                        import fnmatch
+                        if fnmatch.fnmatch(item, pattern):
+                            matches.append(item_path)
+                    elif os.path.isdir(item_path):
+                        # Recurse into subdirectory
+                        search(item_path, depth + 1)
+            except (PermissionError, OSError):
+                pass  # Skip directories we can't access
+
+        search(base_dir, 0)
+        return matches
 
     def extract_tarball(self):
         """Extract tarball to temporary directory"""
@@ -131,6 +192,11 @@ class SubmarinerAnalyzer:
             if ':' in line:
                 key, value = line.split(':', 1)
                 manifest[key.strip()] = value.strip()
+
+        # Store cable driver for later use
+        if 'Cable driver' in manifest:
+            self.cable_driver = manifest['Cable driver']
+
         return manifest
 
     def detect_cni(self, cluster):
@@ -668,10 +734,14 @@ class SubmarinerAnalyzer:
             if "Tunnels can be established" in inter_cluster and "✓" in inter_cluster:
                 self._print(f"  {Colors.OKGREEN}✓{Colors.ENDC} Inter-cluster firewall: PASSED")
                 self._print("    UDP ports are open - firewall is NOT blocking tunnel traffic")
-                self.recommendations.append("Firewall is OK - investigate other tunnel issues: routing, IPsec config, or endpoint reachability")
+                if self.cable_driver == "libreswan":
+                    self.recommendations.append("Firewall is OK - investigate other tunnel issues: routing, IPsec config, or endpoint reachability")
+                else:
+                    self.recommendations.append(f"Firewall is OK - investigate other tunnel issues: routing, {self.cable_driver} config, or endpoint reachability")
 
-                # Cross-reference with IPsec counters if available
-                self.recommendations.append("Check IPsec counters in gather data (ipsec-trafficstatus.log) to verify traffic flow")
+                # Cross-reference with IPsec counters if cable driver is libreswan
+                if self.cable_driver == "libreswan":
+                    self.recommendations.append("Check IPsec counters in gather data (ipsec-trafficstatus.log) to verify traffic flow")
             elif "CONTEXT: This test was run because:" in inter_cluster:
                 # Test ran - check for failures
                 if "error" in inter_cluster.lower() or "fail" in inter_cluster.lower() or "cannot" in inter_cluster.lower() or "timed out" in inter_cluster.lower():
@@ -686,16 +756,18 @@ class SubmarinerAnalyzer:
                         self._print(f"      - Look for outbound UDP packets on port {natt_port} (NAT-T)")
                         self._print("      - Check if UDP packets are egressing but not ingressing")
 
-                    # Reference IPsec counters
-                    self._print(f"    {Colors.WARNING}Additional data:{Colors.ENDC} Check IPsec counters in gather/")
-                    self._print("      - cluster*/gather/cluster*/ipsec-trafficstatus.log")
-                    self._print("      - Look for 0 bytes in/out indicating no traffic flow")
+                    # Reference IPsec counters (only if cable driver is libreswan)
+                    if self.cable_driver == "libreswan":
+                        self._print(f"    {Colors.WARNING}Additional data:{Colors.ENDC} Check IPsec counters in gather/")
+                        self._print("      - cluster*/gather/cluster*/ipsec-trafficstatus.log")
+                        self._print("      - Look for 0 bytes in/out indicating no traffic flow")
 
                     self.recommendations.append(f"Fix inter-cluster firewall: allow UDP traffic on NAT-T port {natt_port} between gateway nodes")
                     self.recommendations.append("Cloud environments: Check security group rules between gateway node IPs")
                     self.recommendations.append(f"On-premise: Verify firewall allows UDP {natt_port} or ESP (protocol 50) depending on cable driver config")
                     self.recommendations.append(f"Cross-check tcpdump data: verify UDP packets on port {natt_port} are flowing in both directions")
-                    self.recommendations.append("Check IPsec traffic counters: ipsec-trafficstatus.log should show non-zero bytes if traffic flowing")
+                    if self.cable_driver == "libreswan":
+                        self.recommendations.append("Check IPsec traffic counters: ipsec-trafficstatus.log should show non-zero bytes if traffic flowing")
 
                     # Extract specific error
                     error_match = re.search(r'(error|Error|ERROR|FAILED|timeout)[^\n]*', inter_cluster)
@@ -880,16 +952,31 @@ class SubmarinerAnalyzer:
 
     def detect_blocking_type(self):
         """Detect if ESP or UDP is being blocked"""
-        self._print(f"\n{Colors.BOLD}=== Detecting Blocking Type ==={Colors.ENDC}")
-
         # Read Gateway CRs
         gateway1 = self.find_and_read_gateway_cr("cluster1")
         gateway2 = self.find_and_read_gateway_cr("cluster2")
 
         if not gateway1 and not gateway2:
-            self._print(f"  {Colors.WARNING}⚠{Colors.ENDC} Could not read Gateway CRs")
-            self._print("     Possible cause: subctl gather failed (check collection.log for details)")
+            # Skip section if no data available (don't print empty header)
             return
+
+        # Only print header if we have data to analyze
+        has_output = False
+
+        # Check if analyze_gateway_blocking will produce output
+        # (only outputs when cable driver is libreswan and not connected)
+        for gw, cluster in [(gateway1, "cluster1"), (gateway2, "cluster2")]:
+            if gw and 'status' in gw and 'gateways' in gw['status']:
+                for gateway_entry in gw['status']['gateways']:
+                    for conn in gateway_entry.get('connections', []):
+                        if conn.get('status') != 'connected':
+                            has_output = True
+                            break
+
+        if not has_output:
+            return
+
+        self._print(f"\n{Colors.BOLD}=== Detecting Blocking Type ==={Colors.ENDC}")
 
         # Analyze cluster1
         if gateway1:
@@ -947,33 +1034,20 @@ class SubmarinerAnalyzer:
             self._print(f"{Colors.FAIL}{'='*60}{Colors.ENDC}\n")
 
     def find_and_read_gateway_cr(self, cluster):
-        """Find and read the Gateway CR YAML"""
+        """Find and read the Submariner CR YAML (which contains Gateway status)"""
         gather_dir = os.path.join(self.diagnostics_dir, cluster, "gather")
         if not os.path.exists(gather_dir):
             return None
 
-        # Navigate through nested subdirectories (can be cluster/gather/name/k8s-id/)
-        current_dir = gather_dir
-        depth = 0
+        # Find submariner CR files recursively
+        submariner_files = self.find_files_recursive(gather_dir, "submariners_*.yaml")
 
-        while depth < 4:
-            all_files = os.listdir(current_dir)
+        if not submariner_files:
+            return None
 
-            # Look for submariner CR YAML in current directory
-            for file in all_files:
-                if file.startswith("submariners_") and file.endswith(".yaml"):
-                    relative_path = os.path.relpath(os.path.join(current_dir, file), self.diagnostics_dir)
-                    return self.read_yaml(relative_path)
-
-            # If not found, go deeper
-            subdirs = [d for d in all_files if os.path.isdir(os.path.join(current_dir, d))]
-            if not subdirs:
-                break
-
-            current_dir = os.path.join(current_dir, subdirs[0])
-            depth += 1
-
-        return None
+        # Read the first matching file (there should only be one)
+        relative_path = os.path.relpath(submariner_files[0], self.diagnostics_dir)
+        return self.read_yaml(relative_path)
 
     def find_and_read_routeagent_crs(self, cluster):
         """
@@ -1156,6 +1230,17 @@ class SubmarinerAnalyzer:
 
     def analyze_loadbalancer_config(self):
         """Analyze load balancer service configuration for hosted clusters"""
+        # Check if there's any load balancer service before printing header
+        has_lb_service = False
+        for cluster_name in ['cluster1', 'cluster2']:
+            service = self.check_loadbalancer_service(cluster_name)
+            if service:
+                has_lb_service = True
+                break
+
+        if not has_lb_service:
+            return  # No load balancer services found, skip section
+
         self._print(f"\n{Colors.BOLD}=== Checking Load Balancer Configuration ==={Colors.ENDC}")
 
         for cluster_name in ['cluster1', 'cluster2']:
@@ -1275,19 +1360,37 @@ class SubmarinerAnalyzer:
         if packets1_total > 0:
             direction = []
             if packets1_out:
-                direction.append("Out")
+                direction.append("Out (egress)")
             if packets1_in:
-                direction.append("In")
+                direction.append("In (ingress)")
             self._print(f"    Direction: {', '.join(direction) if direction else 'Unknown'}")
 
         self._print(f"  Cluster2 gateway: {packets2_total} packets captured")
         if packets2_total > 0:
             direction = []
             if packets2_out:
-                direction.append("Out")
+                direction.append("Out (egress)")
             if packets2_in:
-                direction.append("In")
+                direction.append("In (ingress)")
             self._print(f"    Direction: {', '.join(direction) if direction else 'Unknown'}")
+
+        # COLLECT tcpdump data for correlation analysis
+        self.tunnel_diagnostics['cluster1']['tcpdump_stats']['total_packets'] = packets1_total
+        self.tunnel_diagnostics['cluster1']['tcpdump_stats']['has_outbound'] = packets1_out
+        self.tunnel_diagnostics['cluster1']['tcpdump_stats']['has_inbound'] = packets1_in
+
+        self.tunnel_diagnostics['cluster2']['tcpdump_stats']['total_packets'] = packets2_total
+        self.tunnel_diagnostics['cluster2']['tcpdump_stats']['has_outbound'] = packets2_out
+        self.tunnel_diagnostics['cluster2']['tcpdump_stats']['has_inbound'] = packets2_in
+
+        # Extract ICMP unreachable messages if present
+        if cluster1_analysis:
+            icmp_unreachable = self._extract_icmp_unreachable(cluster1_analysis)
+            self.tunnel_diagnostics['cluster1']['icmp_unreachable'] = icmp_unreachable
+
+        if cluster2_analysis:
+            icmp_unreachable = self._extract_icmp_unreachable(cluster2_analysis)
+            self.tunnel_diagnostics['cluster2']['icmp_unreachable'] = icmp_unreachable
 
         # Analyze bidirectional traffic patterns
         if packets1_total > 0 and packets2_total > 0:
@@ -1551,6 +1654,24 @@ class SubmarinerAnalyzer:
             return int(match.group(1))
         return 0
 
+    def _extract_icmp_unreachable(self, analysis_content):
+        """
+        Extract ICMP host unreachable messages from tcpdump analysis.
+
+        These messages indicate routing failures where the gateway cannot
+        route packets to the destination GlobalNet CIDR.
+
+        Returns: List of unreachable IP addresses
+        """
+        if not analysis_content:
+            return []
+
+        unreachable_ips = []
+        # Pattern: "ICMP host 242.0.255.253 unreachable"
+        pattern = r'ICMP host ([\d.]+) unreachable'
+        matches = re.findall(pattern, analysis_content)
+
+        return list(set(matches))  # Return unique IPs
 
     def analyze_pod_health(self):
         """Check pod status"""
@@ -2104,35 +2225,32 @@ class SubmarinerAnalyzer:
                 self._print(f"  {cluster}: {Colors.WARNING}No gather data found{Colors.ENDC}")
                 continue
 
-            # Only look in the subdirectory matching this cluster's name
-            cluster_gather_dir = os.path.join(gather_dir, actual_cluster_name)
-            if not os.path.exists(cluster_gather_dir):
-                self._print(f"  {cluster}: {Colors.WARNING}No gather data for {actual_cluster_name}{Colors.ENDC}")
-                continue
+            # Find pod YAML files recursively
+            pod_files = self.find_files_recursive(gather_dir, "pods_*.yaml")
 
-            # Look for pod YAML files which contain hostIP information
-            for file in os.listdir(cluster_gather_dir):
-                if file.startswith("pods_") and file.endswith(".yaml"):
-                    pods_yaml = self.read_yaml(os.path.join(cluster, "gather", actual_cluster_name, file))
-                    if pods_yaml and isinstance(pods_yaml, dict):
-                        # Handle both single pod and list of pods
-                        pod_list = pods_yaml.get('items', [pods_yaml]) if 'items' in pods_yaml else [pods_yaml]
+            for pod_file in pod_files:
+                relative_path = os.path.relpath(pod_file, self.diagnostics_dir)
+                pods_yaml = self.read_yaml(relative_path)
+                if pods_yaml and isinstance(pods_yaml, dict):
+                    # Handle both single pod and list of pods
+                    pod_list = pods_yaml.get('items', [pods_yaml]) if 'items' in pods_yaml else [pods_yaml]
 
-                        for pod in pod_list:
-                            if not isinstance(pod, dict):
-                                continue
+                    for pod in pod_list:
+                        if not isinstance(pod, dict):
+                            continue
 
-                            # Get hostIP from pod status
-                            host_ip = pod.get('status', {}).get('hostIP')
-                            node_name = pod.get('spec', {}).get('nodeName')
+                        # Get hostIP from pod status
+                        host_ip = pod.get('status', {}).get('hostIP')
+                        node_name = pod.get('spec', {}).get('nodeName')
 
-                            if host_ip:
-                                cluster_ips.add(host_ip)
-                                if node_name:
-                                    node_to_ip[node_name] = host_ip
+                        if host_ip:
+                            cluster_ips.add(host_ip)
+                            if node_name:
+                                node_to_ip[node_name] = host_ip
 
             if not cluster_ips:
-                self._print(f"  {cluster}: {Colors.WARNING}No node IP information found{Colors.ENDC}")
+                self._print(f"  {cluster}: {Colors.WARNING}⚠ Could not extract node IP information from pod data{Colors.ENDC}")
+                self._print(f"           (Network topology analysis requires pod hostIP data from gather output)")
                 continue
 
             # Auto-detect network topology by trying common subnet masks
@@ -2162,24 +2280,40 @@ class SubmarinerAnalyzer:
                 # Report findings if multiple subnets detected at this mask
                 if len(ip_subnets) > 1 and not topology_detected:
                     topology_detected = True
-                    self._print(f"  {cluster}: {Colors.WARNING}Multiple subnets detected{Colors.ENDC}")
-                    self._print(f"    Node IPs span {len(ip_subnets)} different /{subnet_mask} subnets:")
-                    for subnet in sorted(ip_subnets):
-                        num_ips = len(subnet_to_ips[subnet])
-                        self._print(f"    - {subnet} ({num_ips} node{'s' if num_ips > 1 else ''})")
 
-                    self._print(f"\n    {Colors.BOLD}Note:{Colors.ENDC} This indicates non-flat networking (nodes in different /{subnet_mask} networks).")
-                    self._print("    Investigate network topology and routing between these subnets.")
+                    # Detect CNI - OVN-K naturally uses /24 per node (this is expected, not an issue)
+                    cni = self.detect_cni(cluster)
+                    is_ovnk = (cni == "OVNKubernetes")
 
-                    # Only add as issue if we also detected RouteAgent failures
-                    if self.routeagent_data.get(cluster, {}).get('errors', 0) > 0:
-                        self.issues.append(f"{cluster}: Multiple /{subnet_mask} subnets with RouteAgent connectivity errors")
-                        self.recommendations.append(
-                            f"{cluster}: Non-flat networking detected - verify routing between /{subnet_mask} subnets"
-                        )
-                        self.recommendations.append(
-                            f"{cluster}: Ensure nodes can route traffic between: {', '.join(sorted(ip_subnets))}"
-                        )
+                    if is_ovnk:
+                        # OVN-K: Multi-subnet is normal architecture, show as info only
+                        self._print(f"  {cluster}: {Colors.OKBLUE}ℹ{Colors.ENDC} OVN-Kubernetes node subnet allocation detected")
+                        self._print(f"    Node IPs span {len(ip_subnets)} different /{subnet_mask} subnets:")
+                        for subnet in sorted(ip_subnets):
+                            num_ips = len(subnet_to_ips[subnet])
+                            self._print(f"    - {subnet} ({num_ips} node{'s' if num_ips > 1 else ''})")
+                        self._print(f"\n    {Colors.BOLD}Note:{Colors.ENDC} This is normal for OVN-Kubernetes (each node gets a /{subnet_mask} subnet).")
+                        self._print("    OVN overlay handles routing automatically between node subnets.")
+                    else:
+                        # Non-OVN-K: Multi-subnet may indicate routing issues
+                        self._print(f"  {cluster}: {Colors.WARNING}Multiple subnets detected{Colors.ENDC}")
+                        self._print(f"    Node IPs span {len(ip_subnets)} different /{subnet_mask} subnets:")
+                        for subnet in sorted(ip_subnets):
+                            num_ips = len(subnet_to_ips[subnet])
+                            self._print(f"    - {subnet} ({num_ips} node{'s' if num_ips > 1 else ''})")
+
+                        self._print(f"\n    {Colors.BOLD}Note:{Colors.ENDC} This indicates non-flat networking (nodes in different /{subnet_mask} networks).")
+                        self._print("    Investigate network topology and routing between these subnets.")
+
+                        # Only add as issue if we also detected RouteAgent failures
+                        if self.routeagent_data.get(cluster, {}).get('errors', 0) > 0:
+                            self.issues.append(f"{cluster}: Multiple /{subnet_mask} subnets with RouteAgent connectivity errors")
+                            self.recommendations.append(
+                                f"{cluster}: Non-flat networking detected - verify routing between /{subnet_mask} subnets"
+                            )
+                            self.recommendations.append(
+                                f"{cluster}: Ensure nodes can route traffic between: {', '.join(sorted(ip_subnets))}"
+                            )
 
                     self.network_topology[cluster] = {
                         'total_ips': len(cluster_ips),
@@ -2713,11 +2847,30 @@ class SubmarinerAnalyzer:
 
     def check_api_server_health(self):
         """Check for API server rate limiter errors in Gateway pod logs"""
-        self._print(f"\n{Colors.BOLD}=== Checking API Server Health ==={Colors.ENDC}")
-
         cluster_subdirs = self.get_cluster_subdirs()
         if not cluster_subdirs:
             return
+
+        # Check if there are any gateway logs before printing header
+        has_gateway_logs = False
+        for cluster in ['cluster1', 'cluster2']:
+            actual_cluster_name = cluster_subdirs.get(cluster)
+            if not actual_cluster_name:
+                continue
+
+            gather_dir = os.path.join(self.diagnostics_dir, cluster, "gather", actual_cluster_name)
+            if os.path.exists(gather_dir):
+                for file in os.listdir(gather_dir):
+                    if "submariner-gateway-" in file and file.endswith("-submariner-gateway.log"):
+                        has_gateway_logs = True
+                        break
+                if has_gateway_logs:
+                    break
+
+        if not has_gateway_logs:
+            return  # No gateway logs found, skip section
+
+        self._print(f"\n{Colors.BOLD}=== Checking API Server Health ==={Colors.ENDC}")
 
         for cluster in ['cluster1', 'cluster2']:
             actual_cluster_name = cluster_subdirs.get(cluster)
@@ -2809,9 +2962,11 @@ class SubmarinerAnalyzer:
             self.recommendations.append(f"{cluster_name}: Consider investigating why 'ip rule fwmark 0x3f0' exists - it appears to be added by OVN-Kubernetes or NetworkPolicy")
 
         elif len(fwmark_0x3f0_clusters) == 2:
-            self._print(f"  {Colors.OKGREEN}✓{Colors.ENDC} Both clusters have 'fwmark 0x3f0' rule (consistent)")
+            # Both have it - consistent, but only report if we detect issues caused by it
+            pass
         else:
-            self._print(f"  {Colors.OKGREEN}✓{Colors.ENDC} Neither cluster has 'fwmark 0x3f0' rule (consistent)")
+            # Neither has it - consistent, no need to report
+            pass
 
     def check_ovn_routing(self):
         """
@@ -2830,37 +2985,26 @@ class SubmarinerAnalyzer:
             return
 
         for cluster in ['cluster1', 'cluster2']:
-            actual_cluster_name = cluster_subdirs.get(cluster)
-            if not actual_cluster_name:
-                continue
-
-            gather_dir = os.path.join(self.diagnostics_dir, cluster, "gather", actual_cluster_name)
-            if not os.path.exists(gather_dir):
+            gather_base_dir = os.path.join(self.diagnostics_dir, cluster, "gather")
+            if not os.path.exists(gather_base_dir):
                 continue
 
             # Get remote cluster CIDRs from GatewayRoute first, then fall back to Submariner CR
             remote_cidrs = set()
 
-            # Read Submariner CR from the same resolved gather directory
-            gateway_cr = None
-            for file in os.listdir(gather_dir):
-                if file.startswith("submariners_") and file.endswith(".yaml"):
-                    gateway_cr = self.read_yaml(os.path.join(cluster, "gather", actual_cluster_name, file))
-                    break
+            # Use find_and_read_gateway_cr which now searches recursively
+            gateway_cr = self.find_and_read_gateway_cr(cluster)
 
-            # Aggregate remote CIDRs from every GatewayRoute CR in the bundle
-            for file in os.listdir(gather_dir):
-                if not file.startswith("gatewayroutes_"):
-                    continue
-                gateway_route_content = self.read_file(os.path.join(cluster, "gather", actual_cluster_name, file))
-                if not gateway_route_content:
-                    continue
+            # Find and aggregate remote CIDRs from every GatewayRoute CR
+            gatewayroute_files = self.find_files_recursive(gather_base_dir, "gatewayroutes_*.yaml")
+            for gr_file in gatewayroute_files:
                 try:
-                    gateway_route = yaml.safe_load(gateway_route_content)
+                    with open(gr_file) as f:
+                        gateway_route = yaml.safe_load(f)
                     if gateway_route and 'spec' in gateway_route:
                         remote_cidrs.update(gateway_route['spec'].get('remoteCIDRs', []))
-                except (yaml.YAMLError, ValueError) as exc:
-                    self._print(f"  {Colors.WARNING}⚠{Colors.ENDC} {cluster}: failed to parse {file}: {exc}")
+                except (yaml.YAMLError, ValueError, OSError) as exc:
+                    self._print(f"  {Colors.WARNING}⚠{Colors.ENDC} {cluster}: failed to parse GatewayRoute: {exc}")
 
             # Fall back to Submariner CR if no GatewayRoute found
             if not remote_cidrs:
@@ -2870,7 +3014,8 @@ class SubmarinerAnalyzer:
                             remote_cidrs.update(conn.get('endpoint', {}).get('subnets', []))
 
             if not remote_cidrs:
-                self._print(f"  {Colors.WARNING}⚠{Colors.ENDC} {cluster}: no remote CIDRs found for OVN route validation")
+                self._print(f"  {Colors.WARNING}⚠{Colors.ENDC} {cluster}: Could not extract remote cluster CIDR information")
+                self._print(f"           (OVN route validation requires remote subnet data from Gateway CR or Endpoint)")
                 continue
 
             # Get active gateway node hostname from Gateway CR
@@ -2882,37 +3027,48 @@ class SubmarinerAnalyzer:
                         active_gateway_node = gw.get('localEndpoint', {}).get('hostname')
                         break
 
-            # Check OVN router policies (should exist on ALL nodes)
+            # Check OVN router policies (should exist on ALL nodes) - find files recursively
+            policy_files = self.find_files_recursive(gather_base_dir, "*_ovn_lr_ovn_cluster_router_policies.log")
             policies_checked = False
-            for file in os.listdir(gather_dir):
-                if file.endswith("_ovn_lr_ovn_cluster_router_policies.log"):
-                    policies_content = self.read_file(os.path.join(cluster, "gather", actual_cluster_name, file))
-                    if policies_content:
-                        policies_checked = True
-                        node_name = file.replace("_ovn_lr_ovn_cluster_router_policies.log", "")
-                        # Check for Submariner router policies (priority 20000)
-                        for cidr in remote_cidrs:
-                            policy_match = f"ip4.dst == {cidr}"
-                            # Check that both the CIDR and exact priority 20000 appear on the same line
-                            found = False
-                            for line in policies_content.splitlines():
-                                if policy_match in line and re.search(r'\b20000\b', line):
-                                    found = True
-                                    break
-                            if found:
-                                self._print(f"  {Colors.OKGREEN}✓{Colors.ENDC} {cluster}/{node_name}: OVN router policy found for {cidr}")
-                            else:
-                                self._print(f"  {Colors.FAIL}✗{Colors.ENDC} {cluster}/{node_name}: OVN router policy MISSING for {cidr}")
-                                self.issues.append(f"{cluster}/{node_name}: OVN router policy missing for {cidr}")
+
+            for policy_file in policy_files:
+                try:
+                    with open(policy_file) as f:
+                        policies_content = f.read()
+                except OSError:
+                    continue
+
+                    policies_checked = True
+                    node_name = os.path.basename(policy_file).replace("_ovn_lr_ovn_cluster_router_policies.log", "")
+                    # Check for Submariner router policies (priority 20000)
+                    for cidr in remote_cidrs:
+                        policy_match = f"ip4.dst == {cidr}"
+                        # Check that both the CIDR and exact priority 20000 appear on the same line
+                        found = False
+                        for line in policies_content.splitlines():
+                            if policy_match in line and re.search(r'\b20000\b', line):
+                                found = True
+                                break
+                        if found:
+                            self._print(f"  {Colors.OKGREEN}✓{Colors.ENDC} {cluster}/{node_name}: OVN router policy found for {cidr}")
+                        else:
+                            self._print(f"  {Colors.FAIL}✗{Colors.ENDC} {cluster}/{node_name}: OVN router policy MISSING for {cidr}")
+                            self.issues.append(f"{cluster}/{node_name}: OVN router policy missing for {cidr}")
 
             if not policies_checked:
                 self._print(f"  {Colors.WARNING}⚠{Colors.ENDC} {cluster}: no OVN router policy logs found")
 
             # Check OVN static routes (should ONLY exist on gateway nodes)
             if active_gateway_node:
-                gateway_routes_file = f"{active_gateway_node}_ovn_lr_ovn_cluster_router_routes.log"
-                gateway_routes_path = os.path.join(cluster, "gather", actual_cluster_name, gateway_routes_file)
-                routes_content = self.read_file(gateway_routes_path)
+                # Find gateway routes file recursively
+                gateway_routes_files = self.find_files_recursive(gather_base_dir, f"{active_gateway_node}_ovn_lr_ovn_cluster_router_routes.log")
+                routes_content = None
+                if gateway_routes_files:
+                    try:
+                        with open(gateway_routes_files[0]) as f:
+                            routes_content = f.read()
+                    except OSError:
+                        pass
 
                 if routes_content:
                     for cidr in remote_cidrs:
@@ -3027,18 +3183,14 @@ class SubmarinerAnalyzer:
             return
 
         for cluster in ['cluster1', 'cluster2']:
-            actual_cluster_name = cluster_subdirs.get(cluster)
-            if not actual_cluster_name:
-                continue
-
-            gather_dir = os.path.join(self.diagnostics_dir, cluster, "gather", actual_cluster_name)
-            if not os.path.exists(gather_dir):
+            gather_base_dir = os.path.join(self.diagnostics_dir, cluster, "gather")
+            if not os.path.exists(gather_base_dir):
                 continue
 
             self._print(f"\n  Checking {cluster}:")
 
-            # Find nftables files
-            nftables_files = glob.glob(os.path.join(gather_dir, "*_nftables.log"))
+            # Find nftables files recursively from gather base directory
+            nftables_files = self.find_files_recursive(gather_base_dir, "*_nftables.log")
             if not nftables_files:
                 self._print(f"    {Colors.WARNING}⚠{Colors.ENDC} No nftables files found (pre-0.22 or collection failed)")
                 continue
@@ -3064,21 +3216,22 @@ class SubmarinerAnalyzer:
                     self._print(f"    {Colors.WARNING}⚠{Colors.ENDC} Invalid gateway node name: {gateway_node}")
                 else:
                     self._print(f"    Analyzing gateway node: {gateway_node}")
-                    gateway_nft_file = os.path.join(gather_dir, f"{gateway_node}_nftables.log")
 
-                    # Verify the resolved path is within gather_dir (prevent traversal)
-                    real_gather_dir = os.path.realpath(gather_dir)
-                    real_nft_file = os.path.realpath(gateway_nft_file)
-                    if not real_nft_file.startswith(real_gather_dir):
-                        self._print(f"    {Colors.WARNING}⚠{Colors.ENDC} Path traversal attempt detected")
-                    elif os.path.exists(gateway_nft_file):
+                    # Find the gateway node's nftables file (may be in subdirectory)
+                    gateway_nft_files = [f for f in nftables_files if gateway_node in os.path.basename(f)]
+
+                    if gateway_nft_files:
+                        # Use the first matching file
+                        gateway_nft_file = gateway_nft_files[0]
                         self._analyze_nftables_file(gateway_nft_file, cluster, gateway_node,
                                                     globalnet_enabled, is_gateway=True)
+                    else:
+                        self._print(f"    {Colors.WARNING}⚠{Colors.ENDC} No nftables file found for gateway node {gateway_node}")
 
             # Check OVN-K SNAT exemptions on gateway node if OVN-K
             cni = self.detect_cni(cluster)
             if "OVN" in cni and gateway_node:
-                self._check_ovn_snat_exemptions(gather_dir, cluster, gateway_node)
+                self._check_ovn_snat_exemptions(gather_base_dir, cluster, gateway_node)
 
     def _analyze_nftables_file(self, nft_file, cluster, node_name, globalnet_enabled, is_gateway=False):
         """Parse and analyze a single nftables file."""
@@ -3093,43 +3246,121 @@ class SubmarinerAnalyzer:
         if is_gateway and globalnet_enabled:
             self._check_globalnet_snat(content, cluster, node_name)
 
-        # Check 2: MSS clamping
+        # Check 2: Globalnet health check DNAT counters (only on gateway, only if globalnet enabled)
+        if is_gateway and globalnet_enabled:
+            self._check_globalnet_health_check_dnat(content, cluster, node_name)
+
+        # Check 3: MSS clamping
         if is_gateway:
             self._check_mss_clamping(content, cluster, node_name)
 
     def _check_globalnet_snat(self, nft_content, cluster, node_name):
-        """Check for globalnet SNAT rules in SUBMARINER-POSTROUTING chain."""
-        # Find SUBMARINER-POSTROUTING chain
-        postrouting_match = re.search(r'chain SUBMARINER-POSTROUTING \{([^}]+)\}', nft_content, re.DOTALL)
-        if not postrouting_match:
-            self._print(f"    {Colors.WARNING}⚠{Colors.ENDC} SUBMARINER-POSTROUTING chain not found")
+        """Check for globalnet SNAT rules in SM-GN-EGRESS-* chains."""
+        # Globalnet SNAT rules are in SM-GN-EGRESS-* chains (e.g., SM-GN-EGRESS-CLUSTER, SM-GN-EGRESS-PODS)
+        # Look for all SM-GN-EGRESS-* chains
+        snat_chains = re.findall(r'chain (SM-GN-EGRESS-\w+) \{([^}]+)\}', nft_content, re.DOTALL)
+
+        if not snat_chains:
+            # Fallback: check old location (SUBMARINER-POSTROUTING)
+            postrouting_match = re.search(r'chain SUBMARINER-POSTROUTING \{([^}]+)\}', nft_content, re.DOTALL)
+            if postrouting_match:
+                chain_content = postrouting_match.group(1)
+                snat_rules = re.findall(r'snat (?:ip )?to (\S+)', chain_content)
+                if snat_rules:
+                    snat_chains = [('SUBMARINER-POSTROUTING', chain_content)]
+
+        if not snat_chains:
+            self._print(f"    {Colors.WARNING}⚠{Colors.ENDC} No globalnet SNAT chains found (SM-GN-EGRESS-* or SUBMARINER-POSTROUTING)")
+            self.issues.append(f"{cluster}: Globalnet enabled but no SNAT chains in nftables")
             return
 
-        chain_content = postrouting_match.group(1)
+        # Collect all SNAT rules across all chains
+        all_snat_rules = []
+        for chain_name, chain_content in snat_chains:
+            snat_rules = re.findall(r'snat (?:ip )?to (\S+)', chain_content)
+            all_snat_rules.extend(snat_rules)
 
-        # Look for SNAT rules (format: "snat to X.X.X.X" or "snat ip to X.X.X.X")
-        snat_rules = re.findall(r'snat (?:ip )?to (\S+)', chain_content)
-
-        if not snat_rules:
-            self._print(f"    {Colors.WARNING}⚠{Colors.ENDC} No globalnet SNAT rules found (globalnet enabled but no SNAT)")
-            self.issues.append(f"{cluster}: Globalnet enabled but no SNAT rules in nftables")
+        if not all_snat_rules:
+            self._print(f"    {Colors.WARNING}⚠{Colors.ENDC} Globalnet SNAT chains exist but no SNAT rules found")
+            self.issues.append(f"{cluster}: Globalnet SNAT chains exist but contain no SNAT rules")
             return
 
         # Check for 0.0.0.0 SNAT (the bug we're trying to catch!)
-        for snat_ip in snat_rules:
+        has_valid_snat = False
+        for snat_ip in all_snat_rules:
             if snat_ip == "0.0.0.0":
                 self._print(f"    {Colors.FAIL}✗{Colors.ENDC} Globalnet SNAT to 0.0.0.0 detected!")
                 self.issues.append(f"{cluster}: Globalnet SNAT IP is 0.0.0.0 (source IP allocation failed)")
             else:
-                self._print(f"    {Colors.OKGREEN}✓{Colors.ENDC} Globalnet SNAT to {snat_ip}")
+                has_valid_snat = True
+                # Only show first SNAT IP to avoid clutter (there can be many rules)
+                break
 
-        # Check packet counters
-        counter_match = re.search(r'snat.*counter packets (\d+) bytes', chain_content)
-        if counter_match:
-            packets = int(counter_match.group(1))
-            if packets == 0:
-                self._print(f"    {Colors.WARNING}⚠{Colors.ENDC} Globalnet SNAT rule exists but 0 packets matched")
-                self._print("      → Likely: Traffic not reaching nftables (check IP rules)")
+        if has_valid_snat:
+            self._print(f"    {Colors.OKGREEN}✓{Colors.ENDC} Globalnet SNAT rules found ({len(all_snat_rules)} rules)")
+
+        # Check packet counters from all chains
+        # Format: "counter packets N bytes M snat to X.X.X.X"
+        total_packets = 0
+        for chain_name, chain_content in snat_chains:
+            counter_matches = re.findall(r'counter packets (\d+) bytes \d+ snat', chain_content)
+            for counter in counter_matches:
+                total_packets += int(counter)
+
+        # Store SNAT counter for correlation analysis
+        self.tunnel_diagnostics[cluster]['snat_counter'] = total_packets
+
+        if total_packets > 0:
+            self._print(f"    ✓ SNAT counter: {total_packets:,} packets")
+        else:
+            self._print(f"    {Colors.WARNING}⚠{Colors.ENDC} Globalnet SNAT rules exist but 0 packets matched")
+            self._print("      → Likely: Traffic not reaching nftables SNAT stage (check IP rules, routing)")
+
+    def _check_globalnet_health_check_dnat(self, nft_content, cluster, node_name):
+        """
+        Collect GlobalNet health check DNAT counters for correlation analysis.
+
+        GlobalNet uses DNAT to translate remote cluster's health check IP (GlobalNet IP)
+        to local ovn-k8s-mp0 interface IP for health check response.
+
+        Format: ip protocol icmp ip daddr 242.X.255.253 counter packets N bytes M dnat to 172.17.X.X
+
+        This data is collected and later correlated with:
+        - Tcpdump packet flow (are packets being sent?)
+        - Routing tables (can packets reach DNAT rule?)
+        - ICMP unreachable messages (is routing broken?)
+
+        Conclusion happens in correlate_tunnel_failure() after all evidence is collected.
+        """
+        # Find SUBMARINER-GN-INGRESS chain
+        ingress_match = re.search(r'chain SUBMARINER-GN-INGRESS \{([^}]+)\}', nft_content, re.DOTALL)
+        if not ingress_match:
+            # Chain might not exist in older versions
+            return
+
+        chain_content = ingress_match.group(1)
+
+        # Look for health check DNAT rules
+        # Format: ip protocol icmp ip daddr 242.X.255.253 counter packets N bytes M dnat to 172.17.X.X
+        dnat_pattern = r'ip protocol icmp ip daddr ([\d.]+) counter packets (\d+) bytes (\d+) dnat to ([\d.]+)'
+        dnat_matches = re.findall(dnat_pattern, chain_content)
+
+        if not dnat_matches:
+            # No health check DNAT rules found (unexpected for GlobalNet)
+            return
+
+        for health_check_ip, packets, bytes_count, target_ip in dnat_matches:
+            packets_int = int(packets)
+
+            # COLLECT data for later correlation (don't conclude yet)
+            self.tunnel_diagnostics[cluster]['dnat_counters']['health_check_ip'] = health_check_ip
+            self.tunnel_diagnostics[cluster]['dnat_counters']['target_ip'] = target_ip
+            self.tunnel_diagnostics[cluster]['dnat_counters']['packets'] = packets_int
+            self.tunnel_diagnostics[cluster]['dnat_counters']['bytes'] = int(bytes_count)
+
+            # Display the data (informational, no conclusion)
+            self._print(f"    Health check DNAT: {health_check_ip} → {target_ip}")
+            self._print(f"      Counter: {packets_int:,} packets ({int(bytes_count):,} bytes)")
 
     def _check_mss_clamping(self, nft_content, cluster, node_name):
         """Check MSS clamping packet counters."""
@@ -3165,15 +3396,15 @@ class SubmarinerAnalyzer:
 
         self._print(f"      Expected CIDRs: {', '.join(remote_cidrs)}")
 
-        # Check only the gateway node's nftables file
-        gateway_nft_file = os.path.join(gather_dir, f"{gateway_node}_nftables.log")
+        # Find the gateway node's nftables file - search recursively
+        gateway_nft_files = self.find_files_recursive(gather_dir, f"{gateway_node}_nftables.log")
 
-        if not os.path.exists(gateway_nft_file):
+        if not gateway_nft_files:
             self._print(f"      {Colors.WARNING}⚠{Colors.ENDC} Gateway nftables file not found")
             return
 
         try:
-            with open(gateway_nft_file, encoding='utf-8') as f:
+            with open(gateway_nft_files[0], encoding='utf-8') as f:
                 content = f.read()
         except (OSError, UnicodeDecodeError) as e:
             self._print(f"      {Colors.WARNING}⚠{Colors.ENDC} Failed to read gateway nftables: {e}")
@@ -3209,35 +3440,30 @@ class SubmarinerAnalyzer:
 
     def _get_remote_cidrs(self, cluster):
         """Get remote cluster CIDRs (pod + service + globalnet if enabled)."""
-        # Use the same logic as check_ovn_routing() to get remote CIDRs
-        cluster_subdirs = self.get_cluster_subdirs()
-        if not cluster_subdirs or cluster not in cluster_subdirs:
+        gather_base_dir = os.path.join(self.diagnostics_dir, cluster, "gather")
+        if not os.path.exists(gather_base_dir):
             return []
-
-        actual_cluster_name = cluster_subdirs[cluster]
-        gather_dir = os.path.join(self.diagnostics_dir, cluster, "gather", actual_cluster_name)
 
         remote_cidrs = set()
 
-        # Get from GatewayRoute CRs (most reliable)
-        gateway_routes_pattern = os.path.join(gather_dir, "gatewayroutes_*.yaml")
-        gateway_routes_files = glob.glob(gateway_routes_pattern)
-        if gateway_routes_files:
-            for gr_file in gateway_routes_files:
-                # Convert absolute path to relative path for read_yaml
-                rel_path = os.path.relpath(gr_file, self.diagnostics_dir)
-                gateway_route = self.read_yaml(rel_path)
+        # Get from GatewayRoute CRs (most reliable) - search recursively
+        gateway_routes_files = self.find_files_recursive(gather_base_dir, "gatewayroutes_*.yaml")
+        for gr_file in gateway_routes_files:
+            try:
+                with open(gr_file) as f:
+                    gateway_route = yaml.safe_load(f)
                 if gateway_route and 'spec' in gateway_route:
                     remote_cidrs.update(gateway_route['spec'].get('remoteCIDRs', []))
+            except (yaml.YAMLError, OSError):
+                continue
 
-        # Fallback: Get from Gateway CR connections
+        # Fallback: Get from Submariner CR connections (use existing helper)
         if not remote_cidrs:
-            gateway_rel_path = os.path.join(cluster, "gather", actual_cluster_name, "gateway.yaml")
-            gateway_cr = self.read_yaml(gateway_rel_path)
+            gateway_cr = self.find_and_read_gateway_cr(cluster)
             if gateway_cr and 'status' in gateway_cr:
-                connections = gateway_cr['status'].get('connections', [])
-                for conn in connections:
-                    remote_cidrs.update(conn.get('endpoint', {}).get('subnets', []))
+                for gw in gateway_cr['status'].get('gateways', []):
+                    for conn in gw.get('connections', []):
+                        remote_cidrs.update(conn.get('endpoint', {}).get('subnets', []))
 
         # Add globalnet CIDR if enabled
         globalnet_cidr = self.get_remote_globalnet_cidr(cluster)
@@ -3277,28 +3503,30 @@ class SubmarinerAnalyzer:
             if not actual_cluster_name:
                 continue
 
-            gather_dir = os.path.join(self.diagnostics_dir, cluster, "gather", actual_cluster_name)
-            if not os.path.exists(gather_dir):
+            gather_base_dir = os.path.join(self.diagnostics_dir, cluster, "gather")
+            if not os.path.exists(gather_base_dir):
                 continue
 
             self._print(f"\n  Checking {cluster}...")
 
-            # Count nodes with breth0
+            # Count nodes with breth0 - find ip-a.log files recursively
+            ip_a_files = self.find_files_recursive(gather_base_dir, "*_ip-a.log")
             breth0_count = 0
-            total_nodes = 0
-            ip_a_files = []
+            total_nodes = len(ip_a_files)
 
-            for file in os.listdir(gather_dir):
-                if file.endswith("_ip-a.log"):
-                    total_nodes += 1
-                    ip_a_files.append(file)
-                    content = self.read_file(os.path.join(cluster, "gather", actual_cluster_name, file))
-                    if content and re.search(r'^\d+: breth0:', content, re.MULTILINE):
+            for ip_a_file in ip_a_files:
+                try:
+                    with open(ip_a_file) as f:
+                        content = f.read()
+                    if re.search(r'^\d+: breth0:', content, re.MULTILINE):
                         breth0_count += 1
+                except OSError:
+                    continue
 
             # Determine gateway mode (local mode = all nodes have breth0)
             if total_nodes == 0:
-                self._print(f"    {Colors.WARNING}⚠{Colors.ENDC} Could not determine node count")
+                self._print(f"    {Colors.WARNING}⚠{Colors.ENDC} Could not determine node count from gather data")
+                self._print(f"             (OVN-K local gateway mode detection requires ip-a.log files for each node)")
                 continue
 
             is_local_mode = (breth0_count == total_nodes)
@@ -3307,12 +3535,17 @@ class SubmarinerAnalyzer:
                 self._print(f"    {Colors.WARNING}⚠{Colors.ENDC} OVN-K gateway mode: LOCAL")
                 self._print(f"      - All {total_nodes} nodes have breth0 interface")
 
-                # Check Gateway CR status directly
+                # Check Gateway CR status directly - find gateway files recursively
                 gateway_status = 'unknown'
                 gateway_message = ''
-                gateway_files = [f for f in os.listdir(gather_dir) if f.startswith("gateways_")]
+                gateway_files = self.find_files_recursive(gather_base_dir, "gateways_*.yaml")
                 for gw_file in gateway_files:
-                    gw_content = self.read_file(os.path.join(cluster, "gather", actual_cluster_name, gw_file))
+                    try:
+                        with open(gw_file) as f:
+                            gw_content = f.read()
+                    except OSError:
+                        continue
+
                     if gw_content:
                         try:
                             gw_yaml = yaml.safe_load(gw_content)
@@ -3423,8 +3656,8 @@ class SubmarinerAnalyzer:
             if not actual_cluster_name:
                 continue
 
-            gather_dir = os.path.join(self.diagnostics_dir, cluster, "gather", actual_cluster_name)
-            if not os.path.exists(gather_dir):
+            gather_base_dir = os.path.join(self.diagnostics_dir, cluster, "gather")
+            if not os.path.exists(gather_base_dir):
                 continue
 
             self._print(f"\n  {Colors.BOLD}Checking {cluster}:{Colors.ENDC}")
@@ -3432,32 +3665,32 @@ class SubmarinerAnalyzer:
             # Get remote Globalnet CIDR (what IP rule 150 should match)
             remote_globalnet_cidr = self.get_remote_globalnet_cidr(cluster)
 
-            # Get active gateway node
+            # Get active gateway node - find gateway files recursively
             gateway_node = None
-            gateway_files = [f for f in os.listdir(gather_dir) if f.startswith("gateways_")]
+            gateway_files = self.find_files_recursive(gather_base_dir, "gateways_*.yaml")
             for gw_file in gateway_files:
-                gw_content = self.read_file(os.path.join(cluster, "gather", actual_cluster_name, gw_file))
-                if gw_content:
-                    try:
-                        gw_yaml = yaml.safe_load(gw_content)
-                        if gw_yaml and gw_yaml.get('status', {}).get('haStatus') == 'active':
-                            gateway_node = gw_yaml.get('metadata', {}).get('name')
-                            break
-                    except yaml.YAMLError:
-                        continue
+                try:
+                    with open(gw_file) as f:
+                        gw_content = f.read()
+                    gw_yaml = yaml.safe_load(gw_content)
+                    if gw_yaml and gw_yaml.get('status', {}).get('haStatus') == 'active':
+                        gateway_node = gw_yaml.get('metadata', {}).get('name')
+                        break
+                except (yaml.YAMLError, OSError):
+                    continue
 
-            # Verify configuration on all nodes
+            # Verify configuration on all nodes - find ip-rules.log files recursively
             node_results = {}
-            for file in os.listdir(gather_dir):
-                if file.endswith("_ip-rules.log"):
-                    node_name = file.replace("_ip-rules.log", "")
-                    is_gateway = (node_name == gateway_node)
+            ip_rules_files = self.find_files_recursive(gather_base_dir, "*_ip-rules.log")
+            for ip_rules_file in ip_rules_files:
+                node_name = os.path.basename(ip_rules_file).replace("_ip-rules.log", "")
+                is_gateway = (node_name == gateway_node)
 
-                    result = self.verify_node_host_networking(
-                        cluster, actual_cluster_name, node_name,
-                        remote_globalnet_cidr, is_gateway
-                    )
-                    node_results[node_name] = result
+                result = self.verify_node_host_networking(
+                    cluster, ip_rules_file, node_name,
+                    remote_globalnet_cidr, is_gateway, gather_base_dir
+                )
+                node_results[node_name] = result
 
             # Analyze results
             self.analyze_host_networking_results(cluster, node_results, gateway_node)
@@ -3465,18 +3698,23 @@ class SubmarinerAnalyzer:
             # Check gateway logs for 0.0.0.0 source error
             self.check_gateway_logs_for_source_error(cluster, actual_cluster_name)
 
-    def verify_node_host_networking(self, cluster, actual_cluster_name, node_name,
-                                      remote_cidr, is_gateway):
+    def verify_node_host_networking(self, cluster, ip_rules_file_path, node_name,
+                                      remote_cidr, is_gateway, gather_base_dir):
         """
         Verify routing checks on a single node.
 
         NOTE: Our collection script supplements subctl gather by collecting table 150
         from all nodes (subctl gather only collects from gateway nodes).
 
+        Args:
+            cluster: cluster name (cluster1/cluster2)
+            ip_rules_file_path: absolute path to node's ip-rules.log file
+            node_name: name of the node
+            remote_cidr: remote cluster's GlobalNet CIDR
+            is_gateway: whether this is the active gateway node
+
         Returns dict with check results.
         """
-        gather_dir = os.path.join(cluster, "gather", actual_cluster_name)
-
         result = {
             'node_name': node_name,
             'is_gateway': is_gateway,
@@ -3487,7 +3725,12 @@ class SubmarinerAnalyzer:
         }
 
         # Check 1: IP rule 150
-        ip_rules_content = self.read_file(os.path.join(gather_dir, f"{node_name}_ip-rules.log"))
+        try:
+            with open(ip_rules_file_path) as f:
+                ip_rules_content = f.read()
+        except OSError:
+            ip_rules_content = None
+
         if ip_rules_content and remote_cidr:
             # Look for: "150:	from all to 242.1.0.0/16 lookup 150"
             if re.search(rf'150:.*to {re.escape(remote_cidr)}.*lookup 150', ip_rules_content):
@@ -3496,8 +3739,16 @@ class SubmarinerAnalyzer:
             else:
                 result['details']['ip_rule'] = f"Missing: to {remote_cidr} lookup 150"
 
-        # Check 2: Table 150 route
-        table150_content = self.read_file(os.path.join(gather_dir, f"{node_name}_ip-routes-table150.log"))
+        # Check 2: Table 150 route - search recursively due to nested gather structure
+        table150_content = None
+        table150_files = self.find_files_recursive(gather_base_dir, f"{node_name}_ip-routes-table150.log", max_depth=4)
+        if table150_files:
+            try:
+                with open(table150_files[0]) as f:
+                    table150_content = f.read()
+            except OSError:
+                table150_content = None
+
         if table150_content:
             # Look for: "default via X.X.X.X dev ovn-k8s-mp0"
             match = re.search(r'default via ([\d.]+) dev ovn-k8s-mp0', table150_content)
@@ -3510,8 +3761,16 @@ class SubmarinerAnalyzer:
         else:
             result['details']['table150'] = "Missing: Table 150 file not found (likely empty table)"
 
-        # Check 3: ovn-k8s-mp0 interface
-        ip_a_content = self.read_file(os.path.join(gather_dir, f"{node_name}_ip-a.log"))
+        # Check 3: ovn-k8s-mp0 interface - search recursively
+        ip_a_content = None
+        ip_a_files = self.find_files_recursive(gather_base_dir, f"{node_name}_ip-a.log", max_depth=4)
+        if ip_a_files:
+            try:
+                with open(ip_a_files[0]) as f:
+                    ip_a_content = f.read()
+            except OSError:
+                ip_a_content = None
+
         if ip_a_content:
             # Look for ovn-k8s-mp0 with UP state
             interface_match = re.search(r'^\d+: ovn-k8s-mp0:.*<.*UP.*>', ip_a_content, re.MULTILINE)
@@ -3549,7 +3808,12 @@ class SubmarinerAnalyzer:
             return
 
         # Check if any pcap files exist and are non-empty
-        pcap_files = [f for f in os.listdir(ovnk_pinger_dir) if f.endswith('.pcap')]
+        all_pcap_files = [f for f in os.listdir(ovnk_pinger_dir) if f.endswith('.pcap')]
+        if not all_pcap_files:
+            return
+
+        # Filter to only this cluster's files (filenames start with "cluster1-" or "cluster2-")
+        pcap_files = [f for f in all_pcap_files if f.startswith(f"{cluster}-")]
         if not pcap_files:
             return
 
@@ -3806,6 +4070,834 @@ class SubmarinerAnalyzer:
                             self._print(f"  {Colors.OKGREEN}✓{Colors.ENDC} {cluster}: Main table does NOT have remote cluster routes (expected)")
                     break
 
+    def _analyze_segment2_evidence(self, segments):
+        """Analyze inter-cluster tunnel evidence for Segment 2 failures."""
+        self._print(f"    {Colors.BOLD}Segment 2 (Inter-cluster tunnel) Analysis:{Colors.ENDC}")
+
+        # Collect all evidence
+        c1 = self.tunnel_diagnostics['cluster1']
+        c2 = self.tunnel_diagnostics['cluster2']
+        c1_tcpdump = c1['tcpdump_stats'].get('total_packets', 0)
+        c2_tcpdump = c2['tcpdump_stats'].get('total_packets', 0)
+        c1_snat = c1.get('snat_counter', 0)
+        c2_snat = c2.get('snat_counter', 0)
+        c1_dnat = c1['dnat_counters'].get('packets', 0)
+        c2_dnat = c2['dnat_counters'].get('packets', 0)
+
+        # Check if we have GlobalNet data (SNAT/DNAT counters only exist with GlobalNet)
+        has_globalnet_data = (c1_snat > 0 or c2_snat > 0 or c1_dnat > 0 or c2_dnat > 0)
+
+        # Analyze packet flow with nftables correlation (GlobalNet only)
+        if has_globalnet_data:
+            self._print(f"\n      {Colors.BOLD}Packet Flow Analysis (SNAT → Tunnel → DNAT):{Colors.ENDC}")
+            self._print(f"        {Colors.BOLD}Note:{Colors.ENDC} GlobalNet-specific analysis (SNAT/DNAT counters)")
+
+            # cluster2 → cluster1 direction
+            self._print(f"\n      Direction: cluster2 → cluster1")
+        self._print(f"        {Colors.BOLD}cluster2 egress:{Colors.ENDC}")
+        if c2_snat > 0:
+            self._print(f"          ✓ SNAT: {c2_snat:,} packets (GlobalNet egress traffic)")
+        else:
+            self._print(f"          ✗ SNAT: 0 packets (not sending)")
+
+        if c2_tcpdump > 0:
+            self._print(f"          ✓ Tunnel egress: {c2_tcpdump} packets captured")
+        else:
+            self._print(f"          ✗ Tunnel egress: 0 packets")
+
+        self._print(f"        {Colors.BOLD}cluster1 ingress:{Colors.ENDC}")
+        if c1_tcpdump > 0:
+            self._print(f"          ✓ Tunnel ingress: {c1_tcpdump} packets captured")
+        else:
+            self._print(f"          ✗ Tunnel ingress: 0 packets")
+
+        if c1_dnat > 0:
+            self._print(f"          ✓ DNAT: {c1_dnat:,} packets (GlobalNet ingress traffic)")
+        else:
+            self._print(f"          ✗ DNAT: 0 packets (not reaching nftables DNAT)")
+
+        # cluster1 → cluster2 direction
+        self._print(f"\n      Direction: cluster1 → cluster2")
+        self._print(f"        {Colors.BOLD}cluster1 egress:{Colors.ENDC}")
+        if c1_snat > 0:
+            self._print(f"          ✓ SNAT: {c1_snat:,} packets (GlobalNet egress traffic)")
+        else:
+            self._print(f"          ✗ SNAT: 0 packets (not sending)")
+
+        if c1_tcpdump > 0:
+            self._print(f"          ✓ Tunnel egress: {c1_tcpdump} packets captured")
+        else:
+            self._print(f"          ✗ Tunnel egress: 0 packets")
+
+        self._print(f"        {Colors.BOLD}cluster2 ingress:{Colors.ENDC}")
+        if c2_tcpdump > 0:
+            self._print(f"          ✓ Tunnel ingress: {c2_tcpdump} packets captured")
+        else:
+            self._print(f"          ✗ Tunnel ingress: 0 packets")
+
+        if c2_dnat > 0:
+            self._print(f"          ✓ DNAT: {c2_dnat:,} packets (GlobalNet ingress traffic)")
+        else:
+            self._print(f"          ✗ DNAT: 0 packets (not reaching nftables DNAT)")
+
+        # Diagnose based on packet flow pattern
+        self._print(f"\n      {Colors.BOLD}Diagnosis:{Colors.ENDC}")
+        self._print(f"        Note: SNAT/DNAT counters are cumulative (all GlobalNet traffic since nftables loaded)")
+
+        # Check cluster2 → cluster1 path
+        if c2_snat > 0 and c1_tcpdump > 0 and c1_dnat == 0:
+            self._print(f"        cluster2 → cluster1: Packets reach GW1 but not DNAT rule")
+            self._print(f"          → It seems that post-decapsulation routing is broken")
+            self._print(f"          → Packets decapsulated but not routed to ovn-k8s-mp0")
+
+        # Check cluster1 → cluster2 path
+        if c1_snat > 0 and c2_tcpdump > 0 and c2_dnat == 0:
+            self._print(f"        cluster1 → cluster2: Packets reach GW2 but not DNAT rule")
+            self._print(f"          → It seems that post-decapsulation routing is broken")
+            self._print(f"          → Packets decapsulated but not routed to ovn-k8s-mp0")
+
+        # Analyze packet types FIRST to determine actual tunnel health
+        cable_driver = self.cable_driver or 'unknown'
+        icmp_analysis = None
+
+        if cable_driver == 'libreswan':
+            self._print(f"\n      {Colors.BOLD}Cable driver: {cable_driver}{Colors.ENDC}")
+            icmp_analysis = self._analyze_ipsec_pcap_contents()
+            self._print(f"      → Also see 'IPsec Diagnostic Data' section above for detailed analysis")
+        elif cable_driver == 'vxlan':
+            self._print(f"\n      {Colors.BOLD}Cable driver: {cable_driver}{Colors.ENDC}")
+            icmp_analysis = self._analyze_vxlan_pcap_contents()
+
+        # Determine tunnel health based on ICMP packet TYPES (not just any packets)
+        self._print(f"\n      {Colors.BOLD}Tunnel Health Assessment:{Colors.ENDC}")
+
+        if icmp_analysis:
+            c1_data = icmp_analysis.get('cluster1', {})
+            c2_data = icmp_analysis.get('cluster2', {})
+
+            # Check if both clusters are sending proper health checks (Echo Requests)
+            c1_sending_healthchecks = c1_data.get('echo_request_egress', 0) > 0
+            c2_sending_healthchecks = c2_data.get('echo_request_egress', 0) > 0
+
+            # Check if clusters are sending ICMP Unreachable (routing problem)
+            c1_unreachable = c1_data.get('unreachable_egress', 0) > 0
+            c2_unreachable = c2_data.get('unreachable_egress', 0) > 0
+
+            if c1_sending_healthchecks and c2_sending_healthchecks:
+                self._print(f"        ✓ Both clusters sending health checks (Echo Requests)")
+                self._print(f"        → Tunnel datapath appears functional")
+            elif c1_unreachable or c2_unreachable:
+                self._print(f"        ✗ ICMP Unreachable detected - routing issue preventing health checks")
+                if c1_unreachable:
+                    self._print(f"          cluster1: Sending Unreachable instead of Echo Requests")
+                    self._print(f"          → cluster1 cannot route to remote cluster health check IP")
+                    # For VXLAN, check ARP resolution
+                    if cable_driver == 'vxlan':
+                        c1_arp = c1_data.get('arp_count', 0)
+                        if c1_arp == 0:
+                            self._print(f"          → VXLAN: No ARP packets detected - gateway may not be able to resolve remote gateway MAC")
+                if c2_unreachable:
+                    self._print(f"          cluster2: Sending Unreachable instead of Echo Requests")
+                    self._print(f"          → cluster2 cannot route to remote cluster health check IP")
+                    # For VXLAN, check ARP resolution
+                    if cable_driver == 'vxlan':
+                        c2_arp = c2_data.get('arp_count', 0)
+                        if c2_arp == 0:
+                            self._print(f"          → VXLAN: No ARP packets detected - gateway may not be able to resolve remote gateway MAC")
+                self._print(f"        {Colors.BOLD}Root Cause:{Colors.ENDC} Local routing issue (not tunnel failure)")
+            elif not c1_sending_healthchecks and not c2_sending_healthchecks:
+                self._print(f"        ✗ Neither cluster sending health checks")
+                self._print(f"        → Tunnel may not be established OR tcpdump missed packets")
+            else:
+                # Asymmetric: one sending, one not
+                if c1_sending_healthchecks and not c2_sending_healthchecks:
+                    self._print(f"        ⚠ Asymmetric health checks:")
+                    self._print(f"          cluster1: Sending Echo Requests ✓")
+                    self._print(f"          cluster2: NOT sending Echo Requests ✗")
+                    if not c2_unreachable:
+                        self._print(f"          → cluster2: Possible tcpdump timing issue or local routing problem")
+                elif c2_sending_healthchecks and not c1_sending_healthchecks:
+                    self._print(f"        ⚠ Asymmetric health checks:")
+                    self._print(f"          cluster2: Sending Echo Requests ✓")
+                    self._print(f"          cluster1: NOT sending Echo Requests ✗")
+                    if not c1_unreachable:
+                        self._print(f"          → cluster1: Possible tcpdump timing issue or local routing problem")
+        else:
+            # Fallback to basic tcpdump count analysis
+            if c1_tcpdump > 0 and c2_tcpdump > 0:
+                self._print(f"        ⚠ Bidirectional traffic detected (packet types unknown)")
+                self._print(f"        → Cannot determine if health checks are working without ICMP analysis")
+            elif c1_tcpdump == 0 and c2_tcpdump == 0:
+                self._print(f"        ✗ No tunnel traffic detected")
+            else:
+                self._print(f"        ⚠ Asymmetric traffic pattern")
+
+        # Conclusion based on analysis
+        self._print(f"\n      {Colors.BOLD}Recommendation:{Colors.ENDC}")
+        if icmp_analysis and (icmp_analysis.get('cluster1', {}).get('unreachable_egress', 0) > 0 or
+                              icmp_analysis.get('cluster2', {}).get('unreachable_egress', 0) > 0):
+            self._print(f"        Investigate local routing on cluster(s) with ICMP Unreachable")
+            if cable_driver == 'vxlan':
+                # Check if any cluster has ARP issues
+                c1_arp = icmp_analysis.get('cluster1', {}).get('arp_count', 0)
+                c2_arp = icmp_analysis.get('cluster2', {}).get('arp_count', 0)
+                if c1_arp == 0 or c2_arp == 0:
+                    self._print(f"        VXLAN: Check ARP resolution (no ARP packets detected)")
+            self._print(f"        Check routes to remote GlobalNet health check IP")
+        else:
+            self._print(f"        Contact Submariner community with this diagnostic tarball")
+            self._print(f"        Include packet analysis showing ICMP types and directions")
+
+    def _analyze_ipsec_pcap_contents(self):
+        """Analyze IPsec/ESP pcap files to see tunnel traffic direction.
+
+        Returns: dict with cluster ICMP analysis data for health assessment
+        """
+        self._print(f"\n      {Colors.BOLD}IPsec Tunnel Traffic Analysis:{Colors.ENDC}")
+
+        tcpdump_dir = os.path.join(self.diagnostics_dir, "tcpdump")
+        if not os.path.exists(tcpdump_dir):
+            self._print(f"        ℹ No tcpdump files available for analysis")
+            return None
+
+        # Find pcap files
+        pcap_files = []
+        for file in os.listdir(tcpdump_dir):
+            if file.endswith('.pcap'):
+                pcap_files.append(os.path.join(tcpdump_dir, file))
+
+        if not pcap_files:
+            self._print(f"        ℹ No pcap files available")
+            return None
+
+        # Store ICMP analysis results for return
+        cluster_results = {}
+
+        # Analyze each pcap file for ESP (IPsec) packets
+        for pcap_file in pcap_files[:2]:  # Limit to first 2 for brevity
+            cluster_name = 'cluster1' if 'cluster1' in os.path.basename(pcap_file) else 'cluster2'
+
+            try:
+                # For IPsec, capture on 'any' interface shows both:
+                # 1. Pre-encapsulation: Original ICMP packets
+                # 2. Post-encapsulation: ESP packets
+
+                # Check for ICMP (pre-encapsulation)
+                result = subprocess.run(
+                    ['tcpdump', '-nnr', pcap_file, 'icmp', '-c', '20'],
+                    capture_output=True, text=True, timeout=5
+                )
+
+                icmp_lines = [line for line in result.stdout.split('\n') if 'ICMP' in line]
+
+                # Count ICMP types and direction
+                echo_request_egress = 0
+                echo_request_ingress = 0
+                echo_reply_egress = 0
+                echo_reply_ingress = 0
+                unreachable_egress = 0
+                unreachable_ingress = 0
+
+                for line in icmp_lines:
+                    is_egress = ' Out ' in line or 'Out IP' in line
+                    is_ingress = ' In ' in line or 'In IP' in line
+
+                    if 'echo request' in line.lower():
+                        if is_egress:
+                            echo_request_egress += 1
+                        elif is_ingress:
+                            echo_request_ingress += 1
+                    elif 'echo reply' in line.lower():
+                        if is_egress:
+                            echo_reply_egress += 1
+                        elif is_ingress:
+                            echo_reply_ingress += 1
+                    elif 'unreachable' in line.lower():
+                        if is_egress:
+                            unreachable_egress += 1
+                        elif is_ingress:
+                            unreachable_ingress += 1
+
+                # Check for ESP packets (post-encapsulation)
+                result = subprocess.run(
+                    ['tcpdump', '-nnr', pcap_file, 'esp', '-c', '20'],
+                    capture_output=True, text=True, timeout=5
+                )
+
+                esp_lines = [line for line in result.stdout.split('\n') if 'ESP' in line]
+
+                # Count ESP packets by direction
+                esp_egress = 0
+                esp_ingress = 0
+
+                for line in esp_lines:
+                    is_egress = ' Out ' in line or 'Out IP' in line
+                    is_ingress = ' In ' in line or 'In IP' in line
+
+                    if is_egress:
+                        esp_egress += 1
+                    elif is_ingress:
+                        esp_ingress += 1
+
+                # Store ICMP analysis for return
+                cluster_results[cluster_name] = {
+                    'echo_request_egress': echo_request_egress,
+                    'echo_request_ingress': echo_request_ingress,
+                    'echo_reply_egress': echo_reply_egress,
+                    'echo_reply_ingress': echo_reply_ingress,
+                    'unreachable_egress': unreachable_egress,
+                    'unreachable_ingress': unreachable_ingress,
+                }
+
+                self._print(f"        {cluster_name}:")
+
+                # Report ICMP packets (pre-encapsulation)
+                total_icmp = (echo_request_egress + echo_request_ingress + echo_reply_egress +
+                             echo_reply_ingress + unreachable_egress + unreachable_ingress)
+                if total_icmp > 0:
+                    self._print(f"          {Colors.BOLD}ICMP Packets (pre-encapsulation):{Colors.ENDC}")
+                    if echo_request_egress > 0:
+                        self._print(f"            ✓ Echo Request (Egress): {echo_request_egress} packets")
+                    if echo_request_ingress > 0:
+                        self._print(f"            ✓ Echo Request (Ingress): {echo_request_ingress} packets")
+                    if echo_reply_egress > 0:
+                        self._print(f"            ✓ Echo Reply (Egress): {echo_reply_egress} packets")
+                    if echo_reply_ingress > 0:
+                        self._print(f"            ✓ Echo Reply (Ingress): {echo_reply_ingress} packets")
+                    if unreachable_egress > 0:
+                        self._print(f"            {Colors.WARNING}⚠{Colors.ENDC} Unreachable (Egress): {unreachable_egress} packets - routing issue")
+                    if unreachable_ingress > 0:
+                        self._print(f"            {Colors.WARNING}⚠{Colors.ENDC} Unreachable (Ingress): {unreachable_ingress} packets - routing issue")
+
+                # Report ESP packet direction (post-encapsulation)
+                total_esp = esp_egress + esp_ingress
+                if total_esp > 0:
+                    self._print(f"          {Colors.BOLD}ESP Packets (post-encapsulation):{Colors.ENDC}")
+                    if esp_egress > 0:
+                        self._print(f"            ✓ Egress: {esp_egress} packets (encrypted tunnel traffic)")
+                    if esp_ingress > 0:
+                        self._print(f"            ✓ Ingress: {esp_ingress} packets (encrypted tunnel traffic)")
+
+                    # Show sample packets with direction
+                    self._print(f"          {Colors.BOLD}Sample packets:{Colors.ENDC}")
+                    sample_count = 0
+                    for line in esp_lines[:3]:
+                        direction = "Egress" if ' Out ' in line else ("Ingress" if ' In ' in line else "Unknown")
+                        # Clean up line for readability
+                        clean_line = line.strip()
+                        if '?' in clean_line:
+                            parts = clean_line.split(maxsplit=3)
+                            if len(parts) >= 4:
+                                clean_line = f"{parts[0]} {parts[2]} {parts[3]}"
+                        self._print(f"            [{direction}] {clean_line}")
+                        sample_count += 1
+                        if sample_count >= 3:
+                            break
+                else:
+                    self._print(f"          ℹ No ESP packets detected")
+
+            except (subprocess.TimeoutExpired, subprocess.CalledProcessError, FileNotFoundError):
+                # tcpdump not available or pcap file issues
+                self._print(f"        {cluster_name}: ⚠ Could not analyze pcap (tcpdump unavailable)")
+
+        return cluster_results
+
+    def _analyze_vxlan_pcap_contents(self):
+        """Analyze VXLAN pcap files to see what packets are being sent.
+
+        Returns: dict with cluster ICMP analysis data for health assessment
+        """
+        self._print(f"\n      {Colors.BOLD}VXLAN Packet Analysis:{Colors.ENDC}")
+
+        tcpdump_dir = os.path.join(self.diagnostics_dir, "tcpdump")
+        if not os.path.exists(tcpdump_dir):
+            self._print(f"        ℹ No tcpdump files available for analysis")
+            return None
+
+        # Find pcap files
+        pcap_files = []
+        for file in os.listdir(tcpdump_dir):
+            if file.endswith('.pcap'):
+                pcap_files.append(os.path.join(tcpdump_dir, file))
+
+        if not pcap_files:
+            self._print(f"        ℹ No pcap files available")
+            return None
+
+        # Store results for validation and return
+        cluster_results = {}
+
+        # Analyze each pcap file for VXLAN contents
+        for pcap_file in pcap_files[:2]:  # Limit to first 2 for brevity
+            cluster_name = 'cluster1' if 'cluster1' in os.path.basename(pcap_file) else 'cluster2'
+
+            # Use tcpdump to analyze pcap contents with detailed ICMP type information
+            try:
+                # Check for ICMP with type details (echo request/reply)
+                result = subprocess.run(
+                    ['tcpdump', '-nnr', pcap_file, 'icmp', '-c', '20'],
+                    capture_output=True, text=True, timeout=5
+                )
+
+                icmp_lines = [line for line in result.stdout.split('\n') if 'ICMP' in line]
+
+                # Count echo requests, replies, and unreachable messages; track direction
+                echo_request_egress = 0
+                echo_request_ingress = 0
+                echo_reply_egress = 0
+                echo_reply_ingress = 0
+                unreachable_egress = 0
+                unreachable_ingress = 0
+
+                for line in icmp_lines:
+                    is_egress = ' Out ' in line or 'Out IP' in line
+                    is_ingress = ' In ' in line or 'In IP' in line
+
+                    if 'echo request' in line.lower():
+                        if is_egress:
+                            echo_request_egress += 1
+                        elif is_ingress:
+                            echo_request_ingress += 1
+                    elif 'echo reply' in line.lower():
+                        if is_egress:
+                            echo_reply_egress += 1
+                        elif is_ingress:
+                            echo_reply_ingress += 1
+                    elif 'unreachable' in line.lower():
+                        if is_egress:
+                            unreachable_egress += 1
+                        elif is_ingress:
+                            unreachable_ingress += 1
+
+                # Check for ARP
+                result = subprocess.run(
+                    ['tcpdump', '-nnr', pcap_file, 'arp', '-c', '10'],
+                    capture_output=True, text=True, timeout=5
+                )
+                arp_count = len([line for line in result.stdout.split('\n') if 'ARP' in line])
+
+                # Get sample VXLAN encapsulated packets with direction
+                result = subprocess.run(
+                    ['tcpdump', '-nnr', pcap_file, 'port', '4500', '-c', '10'],
+                    capture_output=True, text=True, timeout=5
+                )
+                vxlan_lines = result.stdout.split('\n')
+
+                # Store results for cross-cluster validation
+                cluster_results[cluster_name] = {
+                    'echo_request_egress': echo_request_egress,
+                    'echo_request_ingress': echo_request_ingress,
+                    'echo_reply_egress': echo_reply_egress,
+                    'echo_reply_ingress': echo_reply_ingress,
+                    'unreachable_egress': unreachable_egress,
+                    'unreachable_ingress': unreachable_ingress,
+                    'arp_count': arp_count,
+                }
+
+                self._print(f"        {cluster_name}:")
+
+                # Report ICMP packets with type and direction
+                total_icmp = (echo_request_egress + echo_request_ingress + echo_reply_egress +
+                             echo_reply_ingress + unreachable_egress + unreachable_ingress)
+                if total_icmp > 0:
+                    self._print(f"          {Colors.BOLD}ICMP Packets:{Colors.ENDC}")
+                    if echo_request_egress > 0:
+                        self._print(f"            ✓ Echo Request (Egress): {echo_request_egress} packets")
+                    if echo_request_ingress > 0:
+                        self._print(f"            ✓ Echo Request (Ingress): {echo_request_ingress} packets")
+                    if echo_reply_egress > 0:
+                        self._print(f"            ✓ Echo Reply (Egress): {echo_reply_egress} packets")
+                    if echo_reply_ingress > 0:
+                        self._print(f"            ✓ Echo Reply (Ingress): {echo_reply_ingress} packets")
+                    if unreachable_egress > 0:
+                        self._print(f"            {Colors.WARNING}⚠{Colors.ENDC} Unreachable (Egress): {unreachable_egress} packets - routing issue")
+                    if unreachable_ingress > 0:
+                        self._print(f"            {Colors.WARNING}⚠{Colors.ENDC} Unreachable (Ingress): {unreachable_ingress} packets - routing issue")
+
+                if arp_count > 0:
+                    self._print(f"          ✓ ARP packets: {arp_count}")
+
+                # Parse VXLAN packet details with direction indicators
+                self._print(f"          {Colors.BOLD}Sample packets:{Colors.ENDC}")
+                sample_count = 0
+                for line in vxlan_lines[:5]:
+                    if 'UDP-encap' in line or 'VXLAN' in line:
+                        # Extract direction and clean up line
+                        direction = "Egress" if ' Out ' in line else ("Ingress" if ' In ' in line else "Unknown")
+                        # Remove the leading "?" and interface name for cleaner output
+                        clean_line = line.strip()
+                        if '?' in clean_line:
+                            # Format: "timestamp ? Out/In IP src > dst: ..."
+                            parts = clean_line.split(maxsplit=3)
+                            if len(parts) >= 4:
+                                clean_line = f"{parts[0]} {parts[2]} {parts[3]}"
+                        self._print(f"            [{direction}] {clean_line}")
+                        sample_count += 1
+                        if sample_count >= 3:
+                            break
+
+            except (subprocess.TimeoutExpired, subprocess.CalledProcessError, FileNotFoundError):
+                # tcpdump not available or pcap file issues
+                pass
+
+        # Validate cross-cluster consistency to identify tcpdump limitations
+        if len(cluster_results) == 2:
+            self._validate_tcpdump_consistency(cluster_results)
+
+        return cluster_results
+
+    def _validate_tcpdump_consistency(self, cluster_results):
+        """Check if tcpdump captured matching packets on both sides."""
+        c1 = cluster_results.get('cluster1', {})
+        c2 = cluster_results.get('cluster2', {})
+
+        missing_packets = []
+
+        # Check if we have mismatched ingress/egress (indicates tcpdump missed packets)
+        if c1.get('echo_request_ingress', 0) > 0 and c2.get('echo_request_egress', 0) == 0:
+            missing_packets.append(f"cluster2 likely sent {c1['echo_request_ingress']} Echo Requests (cluster1 received them)")
+
+        if c2.get('echo_request_ingress', 0) > 0 and c1.get('echo_request_egress', 0) == 0:
+            missing_packets.append(f"cluster1 likely sent {c2['echo_request_ingress']} Echo Requests (cluster2 received them)")
+
+        if c1.get('echo_reply_ingress', 0) > 0 and c2.get('echo_reply_egress', 0) == 0:
+            missing_packets.append(f"cluster2 likely sent {c1['echo_reply_ingress']} Echo Replies (cluster1 received them)")
+
+        if c2.get('echo_reply_ingress', 0) > 0 and c1.get('echo_reply_egress', 0) == 0:
+            missing_packets.append(f"cluster1 likely sent {c2['echo_reply_ingress']} Echo Replies (cluster2 received them)")
+
+        if missing_packets:
+            self._print(f"\n      {Colors.BOLD}Tcpdump Capture Limitations:{Colors.ENDC}")
+            for packet in missing_packets:
+                self._print(f"        • {packet}")
+            self._print(f"        → Tcpdump started after some packets were sent, or")
+            self._print(f"        → Capture window missed early traffic")
+            self._print(f"        {Colors.OKBLUE}ℹ{Colors.ENDC} For complete packet counts, use nftables SNAT/DNAT counters (cumulative)")
+
+    def _analyze_segment1_evidence(self, segments):
+        """Analyze local routing evidence for Segment 1 failures."""
+        self._print(f"    {Colors.BOLD}Segment 1 (Local routing: Worker→Gateway) Analysis:{Colors.ENDC}")
+
+        # For OVN-K, we already collected and analyzed:
+        # - Table 150 routes (in OVN-K verification section)
+        # - IP rules (in OVN-K verification section)
+        # - OVN policies (in OVN-K verification section)
+
+        cni1 = self.detect_cni('cluster1')
+        cni2 = self.detect_cni('cluster2')
+
+        c1_segment = segments['cluster1_to_cluster2']
+        c2_segment = segments['cluster2_to_cluster1']
+
+        if c1_segment in ['SEGMENT_1_ALL_WORKERS', 'SEGMENT_1_SPECIFIC_WORKERS']:
+            self._print(f"\n      {Colors.BOLD}cluster1 local routing:{Colors.ENDC}")
+            self._print(f"        CNI: {cni1}")
+            self._print(f"        Evidence collected: Table 150 routes, IP rules, nftables")
+            self._print(f"        → See 'OVN-K Host Networking Verification' section above for details")
+
+            if cni1 == 'OVNKubernetes':
+                self._print(f"\n        {Colors.BOLD}Submariner configuration appears correct{Colors.ENDC}")
+                self._print(f"        It seems that this is an infrastructure or OVN-K platform issue")
+                self._print(f"        Recommend contacting Submariner community with this diagnostic tarball:")
+                self._print(f"          https://github.com/submariner-io/submariner/discussions")
+
+        if c2_segment in ['SEGMENT_1_ALL_WORKERS', 'SEGMENT_1_SPECIFIC_WORKERS']:
+            self._print(f"\n      {Colors.BOLD}cluster2 local routing:{Colors.ENDC}")
+            self._print(f"        CNI: {cni2}")
+            self._print(f"        Evidence collected: Table 150 routes, IP rules, nftables")
+            self._print(f"        → See 'OVN-K Host Networking Verification' section above for details")
+
+            if cni2 == 'OVNKubernetes':
+                self._print(f"\n        {Colors.BOLD}Submariner configuration appears correct{Colors.ENDC}")
+                self._print(f"        It seems that this is an infrastructure or OVN-K platform issue")
+                self._print(f"        Recommend contacting Submariner community with this diagnostic tarball:")
+                self._print(f"          https://github.com/submariner-io/submariner/discussions")
+
+    def _determine_faulty_segment(self):
+        """
+        Determine which datapath segment is broken using Gateway + RouteAgent status.
+
+        Returns: dict with segment analysis for both directions
+        """
+        result = {
+            'cluster1_to_cluster2': None,
+            'cluster2_to_cluster1': None
+        }
+
+        # Analyze cluster1 → cluster2
+        c1_gw_status = self.tunnel_status.get('cluster1', {}).get('status', 'unknown')
+        c1_ra_data = self.routeagent_data.get('cluster1', {})
+        c1_ra_errors = c1_ra_data.get('errors', 0)
+        c1_ra_connected = c1_ra_data.get('connected', 0)
+        c1_ra_total = c1_ra_errors + c1_ra_connected
+
+        if c1_gw_status == 'error' and c1_ra_errors == c1_ra_total and c1_ra_total > 0:
+            # Gateway broken + ALL RouteAgents broken = Segment 2 (tunnel)
+            result['cluster1_to_cluster2'] = 'SEGMENT_2_TUNNEL'
+        elif c1_gw_status == 'connected' and c1_ra_errors == c1_ra_total and c1_ra_total > 0:
+            # Gateway working + ALL RouteAgents broken = Segment 1 (local routing)
+            result['cluster1_to_cluster2'] = 'SEGMENT_1_ALL_WORKERS'
+        elif c1_gw_status == 'connected' and c1_ra_errors > 0 and c1_ra_connected > 0:
+            # Gateway working + SOME RouteAgents broken = Segment 1 (specific workers)
+            result['cluster1_to_cluster2'] = 'SEGMENT_1_SPECIFIC_WORKERS'
+        elif c1_gw_status == 'connected' and c1_ra_errors == 0:
+            # All healthy
+            result['cluster1_to_cluster2'] = 'HEALTHY'
+
+        # Analyze cluster2 → cluster1
+        c2_gw_status = self.tunnel_status.get('cluster2', {}).get('status', 'unknown')
+        c2_ra_data = self.routeagent_data.get('cluster2', {})
+        c2_ra_errors = c2_ra_data.get('errors', 0)
+        c2_ra_connected = c2_ra_data.get('connected', 0)
+        c2_ra_total = c2_ra_errors + c2_ra_connected
+
+        if c2_gw_status == 'error' and c2_ra_errors == c2_ra_total and c2_ra_total > 0:
+            result['cluster2_to_cluster1'] = 'SEGMENT_2_TUNNEL'
+        elif c2_gw_status == 'connected' and c2_ra_errors == c2_ra_total and c2_ra_total > 0:
+            result['cluster2_to_cluster1'] = 'SEGMENT_1_ALL_WORKERS'
+        elif c2_gw_status == 'connected' and c2_ra_errors > 0 and c2_ra_connected > 0:
+            result['cluster2_to_cluster1'] = 'SEGMENT_1_SPECIFIC_WORKERS'
+        elif c2_gw_status == 'connected' and c2_ra_errors == 0:
+            result['cluster2_to_cluster1'] = 'HEALTHY'
+
+        return result
+
+    def correlate_tunnel_failure(self):
+        """
+        Correlate tunnel failure evidence from multiple sources.
+
+        Phase 1: Determine faulty segment (Gateway + RouteAgent correlation)
+        Phase 2: Analyze segment-specific evidence
+        Phase 3: Report conclusions with supporting evidence
+
+        Data sources:
+        - A (Logs): errors, warnings
+        - B (Datapath): DNAT counters, routes, IP rules, nftables
+        - C (Tcpdump): packet flow, ICMP unreachable
+        """
+        self._print(f"\n{Colors.BOLD}=== Tunnel Failure Correlation Analysis ==={Colors.ENDC}")
+        self._print(f"  {Colors.OKBLUE}ℹ{Colors.ENDC} Correlating evidence from logs, datapath config, and packet captures\n")
+
+        # Phase 1: Determine faulty segment
+        segments = self._determine_faulty_segment()
+
+        # Report segment analysis
+        self._print(f"  {Colors.BOLD}Datapath Segment Analysis:{Colors.ENDC}\n")
+
+        c1_segment = segments['cluster1_to_cluster2']
+        c2_segment = segments['cluster2_to_cluster1']
+
+        if c1_segment == 'SEGMENT_2_TUNNEL':
+            self._print(f"    cluster1 → cluster2: {Colors.FAIL}✗ Segment 2 (Inter-cluster tunnel) BROKEN{Colors.ENDC}")
+            self._print(f"      GW@cluster1 → GW@cluster2: error")
+            self._print(f"      All RouteAgents@cluster1: error")
+        elif c1_segment == 'SEGMENT_1_ALL_WORKERS':
+            self._print(f"    cluster1 → cluster2: {Colors.FAIL}✗ Segment 1 (Local routing) BROKEN{Colors.ENDC}")
+            self._print(f"      GW@cluster1 → GW@cluster2: connected")
+            self._print(f"      All RouteAgents@cluster1: error")
+        elif c1_segment == 'SEGMENT_1_SPECIFIC_WORKERS':
+            c1_ra_errors = self.routeagent_data.get('cluster1', {}).get('errors', 0)
+            self._print(f"    cluster1 → cluster2: {Colors.WARNING}⚠ Segment 1 (Specific workers) BROKEN{Colors.ENDC}")
+            self._print(f"      GW@cluster1 → GW@cluster2: connected")
+            self._print(f"      {c1_ra_errors} worker(s)@cluster1: error")
+        elif c1_segment == 'HEALTHY':
+            self._print(f"    cluster1 → cluster2: {Colors.OKGREEN}✓ All segments HEALTHY{Colors.ENDC}")
+
+        if c2_segment == 'SEGMENT_2_TUNNEL':
+            self._print(f"    cluster2 → cluster1: {Colors.FAIL}✗ Segment 2 (Inter-cluster tunnel) BROKEN{Colors.ENDC}")
+            self._print(f"      GW@cluster2 → GW@cluster1: error")
+            self._print(f"      All RouteAgents@cluster2: error")
+        elif c2_segment == 'SEGMENT_1_ALL_WORKERS':
+            self._print(f"    cluster2 → cluster1: {Colors.FAIL}✗ Segment 1 (Local routing) BROKEN{Colors.ENDC}")
+            self._print(f"      GW@cluster2 → GW@cluster1: connected")
+            self._print(f"      All RouteAgents@cluster2: error")
+        elif c2_segment == 'SEGMENT_1_SPECIFIC_WORKERS':
+            c2_ra_errors = self.routeagent_data.get('cluster2', {}).get('errors', 0)
+            self._print(f"    cluster2 → cluster1: {Colors.WARNING}⚠ Segment 1 (Specific workers) BROKEN{Colors.ENDC}")
+            self._print(f"      GW@cluster2 → GW@cluster1: connected")
+            self._print(f"      {c2_ra_errors} worker(s)@cluster2: error")
+        elif c2_segment == 'HEALTHY':
+            self._print(f"    cluster2 → cluster1: {Colors.OKGREEN}✓ All segments HEALTHY{Colors.ENDC}")
+
+        # Phase 2: Segment-specific evidence analysis
+        if c1_segment == 'HEALTHY' and c2_segment == 'HEALTHY':
+            self._print(f"\n  {Colors.OKGREEN}✓ Both directions HEALTHY - skipping detailed investigation{Colors.ENDC}")
+            # Still run GlobalNet DNAT analysis for informational purposes
+        else:
+            self._print(f"\n  {Colors.BOLD}Evidence-Based Investigation:{Colors.ENDC}\n")
+
+            # Analyze based on faulty segment
+            if c1_segment == 'SEGMENT_2_TUNNEL' or c2_segment == 'SEGMENT_2_TUNNEL':
+                self._analyze_segment2_evidence(segments)
+
+            if c1_segment in ['SEGMENT_1_ALL_WORKERS', 'SEGMENT_1_SPECIFIC_WORKERS'] or \
+               c2_segment in ['SEGMENT_1_ALL_WORKERS', 'SEGMENT_1_SPECIFIC_WORKERS']:
+                self._analyze_segment1_evidence(segments)
+
+        # Phase 3: GlobalNet DNAT correlation (existing analysis)
+        c1 = self.tunnel_diagnostics['cluster1']
+        c2 = self.tunnel_diagnostics['cluster2']
+
+        # Check if we have GlobalNet DNAT data
+        has_dnat_data = (c1['dnat_counters'].get('packets') is not None or
+                        c2['dnat_counters'].get('packets') is not None)
+
+        if not has_dnat_data:
+            self._print(f"  {Colors.OKBLUE}ℹ{Colors.ENDC} No GlobalNet DNAT data available (non-GlobalNet or pre-0.22 deployment)")
+            return
+
+        # Evidence: DNAT counters (how many health check packets received)
+        c1_dnat_packets = c1['dnat_counters'].get('packets', 0)
+        c2_dnat_packets = c2['dnat_counters'].get('packets', 0)
+
+        # Evidence: Tcpdump packet flow
+        c1_tcpdump_total = c1['tcpdump_stats'].get('total_packets', 0)
+        c2_tcpdump_total = c2['tcpdump_stats'].get('total_packets', 0)
+        c1_has_outbound = c1['tcpdump_stats'].get('has_outbound', False)
+        c2_has_outbound = c2['tcpdump_stats'].get('has_outbound', False)
+
+        # Evidence: ICMP unreachable (routing failures)
+        c1_unreachable = c1['icmp_unreachable']
+        c2_unreachable = c2['icmp_unreachable']
+
+        # Analyze asymmetric health check pattern
+        if c1_dnat_packets == 0 and c2_dnat_packets > 100:
+            # Asymmetry detected: cluster2 receiving, cluster1 NOT receiving
+            self._print(f"  {Colors.FAIL}✗ ASYMMETRIC HEALTH CHECK PATTERN DETECTED:{Colors.ENDC}")
+            self._print(f"    cluster1: receiving 0 health check packets")
+            self._print(f"    cluster2: receiving {c2_dnat_packets:,} health check packets")
+            self._print(f"\n  {Colors.BOLD}Evidence Analysis:{Colors.ENDC}")
+
+            # Check if cluster2 is even trying to send
+            if not c2_has_outbound or c2_tcpdump_total < 10:
+                self._print(f"    {Colors.FAIL}→{Colors.ENDC} cluster2 NOT sending packets (tcpdump: {c2_tcpdump_total} packets)")
+
+                # Check for ICMP unreachable (routing failure)
+                if c2_unreachable:
+                    self._print(f"    {Colors.FAIL}→{Colors.ENDC} cluster2 sending ICMP unreachable for {len(c2_unreachable)} IPs:")
+                    for ip in c2_unreachable[:5]:  # Show first 5
+                        self._print(f"         {ip}")
+                    self._print(f"\n  {Colors.BOLD}Conclusion:{Colors.ENDC}")
+                    self._print(f"    {Colors.FAIL}cluster2 cannot route to cluster1 GlobalNet CIDR{Colors.ENDC}")
+                    self._print(f"    Root cause: Missing routes or routing configuration issue on cluster2")
+
+                    self.issues.append(
+                        "Asymmetric health check failure: cluster2 cannot route to cluster1. "
+                        f"Evidence: (A) ICMP unreachable for {len(c2_unreachable)} IPs, "
+                        f"(B) DNAT counter=0 on cluster1, "
+                        f"(C) cluster2 sending only {c2_tcpdump_total} packets vs cluster1"
+                    )
+                else:
+                    self._print(f"\n  {Colors.BOLD}Conclusion:{Colors.ENDC}")
+                    self._print(f"    {Colors.FAIL}cluster2 datapath issue preventing packet transmission{Colors.ENDC}")
+                    self._print(f"    Recommendation: Check cluster2 routing tables and OVN configuration")
+
+                    self.issues.append(
+                        "Asymmetric health check failure: cluster2 not sending packets. "
+                        f"Evidence: (B) DNAT counter=0 on cluster1, "
+                        f"(C) cluster2 tcpdump shows only {c2_tcpdump_total} packets"
+                    )
+            else:
+                # cluster2 IS sending packets, but cluster1 not receiving
+                self._print(f"    {Colors.OKGREEN}✓{Colors.ENDC} cluster2 sending packets (tcpdump: {c2_tcpdump_total} packets)")
+                self._print(f"    {Colors.FAIL}✗{Colors.ENDC} cluster1 NOT receiving (DNAT counter: 0)")
+
+                if c1_tcpdump_total > 0:
+                    self._print(f"    {Colors.OKGREEN}✓{Colors.ENDC} cluster1 also sending packets (tcpdump: {c1_tcpdump_total} packets)")
+                    self._print(f"    {Colors.OKGREEN}✓{Colors.ENDC} Bidirectional tunnel traffic confirmed")
+
+                self._print(f"\n  {Colors.BOLD}Conclusion:{Colors.ENDC}")
+
+                # Use segment analysis to determine conclusion
+                c1_segment = segments['cluster1_to_cluster2']
+
+                if c1_segment == 'SEGMENT_1_ALL_WORKERS' or c1_segment == 'SEGMENT_1_SPECIFIC_WORKERS':
+                    # Segment analysis confirms: local routing issue
+                    self._print(f"    {Colors.WARNING}Tunnel working, but health check packets not reaching cluster1{Colors.ENDC}")
+                    self._print(f"    Segment analysis: Local routing (Segment 1) appears broken")
+                    self._print(f"    Evidence collected: Table 150 routes, IP rules, OVN configuration")
+                    self._print(f"    → See 'OVN-K Host Networking Verification' section above for details")
+                elif c1_segment == 'SEGMENT_2_TUNNEL':
+                    # Segment says tunnel broken, but tcpdump shows traffic - investigate
+                    self._print(f"    {Colors.WARNING}Gateway shows error, but tunnel traffic detected{Colors.ENDC}")
+                    self._print(f"    This appears to be a health check mechanism issue")
+                    self._print(f"    Actual datapath may be functional despite Gateway error status")
+
+                self.issues.append(
+                    "Asymmetric health check failure: cluster1 not receiving health checks. "
+                    f"Evidence: (B) cluster1 DNAT counter=0, cluster2 DNAT counter={c2_dnat_packets:,}, "
+                    f"(C) bidirectional tunnel traffic confirmed (cluster1: {c1_tcpdump_total}, cluster2: {c2_tcpdump_total})"
+                )
+
+        elif c2_dnat_packets == 0 and c1_dnat_packets > 100:
+            # Reverse asymmetry
+            self._print(f"  {Colors.FAIL}✗ ASYMMETRIC HEALTH CHECK PATTERN DETECTED:{Colors.ENDC}")
+            self._print(f"    cluster1: receiving {c1_dnat_packets:,} health check packets")
+            self._print(f"    cluster2: receiving 0 health check packets")
+            self._print(f"\n  {Colors.BOLD}Evidence Analysis:{Colors.ENDC}")
+
+            if not c1_has_outbound or c1_tcpdump_total < 10:
+                self._print(f"    {Colors.FAIL}→{Colors.ENDC} cluster1 NOT sending packets")
+
+                if c1_unreachable:
+                    self._print(f"    {Colors.FAIL}→{Colors.ENDC} cluster1 sending ICMP unreachable for {len(c1_unreachable)} IPs")
+                    self._print(f"\n  {Colors.BOLD}Conclusion:{Colors.ENDC}")
+                    self._print(f"    {Colors.FAIL}cluster1 cannot route to cluster2 GlobalNet CIDR{Colors.ENDC}")
+
+                    self.issues.append(
+                        "Asymmetric health check failure: cluster1 cannot route to cluster2. "
+                        f"Evidence: (A) ICMP unreachable, (B) DNAT counter=0 on cluster2, "
+                        f"(C) cluster1 sending only {c1_tcpdump_total} packets"
+                    )
+            else:
+                # cluster1 IS sending packets, but cluster2 not receiving
+                self._print(f"    {Colors.OKGREEN}✓{Colors.ENDC} cluster1 sending packets (tcpdump: {c1_tcpdump_total} packets)")
+                self._print(f"    {Colors.FAIL}✗{Colors.ENDC} cluster2 NOT receiving (DNAT counter: 0)")
+
+                if c2_tcpdump_total > 0:
+                    self._print(f"    {Colors.OKGREEN}✓{Colors.ENDC} cluster2 also sending packets (tcpdump: {c2_tcpdump_total} packets)")
+                    self._print(f"    {Colors.OKGREEN}✓{Colors.ENDC} Bidirectional tunnel traffic confirmed")
+
+                self._print(f"\n  {Colors.BOLD}Conclusion:{Colors.ENDC}")
+
+                # Use segment analysis to determine conclusion
+                c2_segment = segments['cluster2_to_cluster1']
+
+                if c2_segment == 'SEGMENT_1_ALL_WORKERS' or c2_segment == 'SEGMENT_1_SPECIFIC_WORKERS':
+                    # Segment analysis confirms: local routing issue
+                    self._print(f"    {Colors.WARNING}Tunnel working, but health check packets not reaching cluster2{Colors.ENDC}")
+                    self._print(f"    Segment analysis: Local routing (Segment 1) appears broken")
+                    self._print(f"    Evidence collected: Table 150 routes, IP rules, OVN configuration")
+                    self._print(f"    → See 'OVN-K Host Networking Verification' section above for details")
+                elif c2_segment == 'SEGMENT_2_TUNNEL':
+                    # Segment says tunnel broken, but tcpdump shows traffic - investigate
+                    self._print(f"    {Colors.WARNING}Gateway shows error, but tunnel traffic detected{Colors.ENDC}")
+                    self._print(f"    This appears to be a health check mechanism issue")
+                    self._print(f"    Actual datapath may be functional despite Gateway error status")
+
+                self.issues.append(
+                    "Asymmetric health check failure: cluster2 not receiving health checks. "
+                    f"Evidence: (B) cluster2 DNAT counter=0, cluster1 DNAT counter={c1_dnat_packets:,}, "
+                    f"(C) bidirectional tunnel traffic confirmed (cluster1: {c1_tcpdump_total}, cluster2: {c2_tcpdump_total})"
+                )
+
+        elif c1_dnat_packets == 0 and c2_dnat_packets == 0:
+            # Neither cluster receiving health checks
+            self._print(f"  {Colors.FAIL}✗ SYMMETRIC HEALTH CHECK FAILURE:{Colors.ENDC}")
+            self._print(f"    Both clusters receiving 0 health check packets")
+            self._print(f"    This suggests a bidirectional routing or datapath issue")
+
+            self.issues.append(
+                "Symmetric health check failure: neither cluster receiving health checks. "
+                "Evidence: (B) Both DNAT counters = 0"
+            )
+
+        else:
+            # Both clusters receiving health checks
+            self._print(f"  {Colors.OKGREEN}✓{Colors.ENDC} Health check packet flow appears healthy:")
+            self._print(f"    cluster1: received {c1_dnat_packets:,} packets")
+            self._print(f"    cluster2: received {c2_dnat_packets:,} packets")
+
     def add_context_aware_recommendations(self):
         """Add context-aware recommendations when no clear root cause is found"""
 
@@ -3926,6 +5018,12 @@ class SubmarinerAnalyzer:
 
             # Check gateway HA labels (critical: multiple active pods)
             self.analyze_gateway_ha_labels()
+
+            # NEW: Correlate tunnel failure evidence (Phase 2 analysis)
+            # This runs after all data collection (logs, datapath config, tcpdump)
+            # and correlates evidence across A+B+C sources
+            if any('tunnel' in fault.lower() or 'connection' in fault.lower() for fault in self.faulty_states):
+                self.correlate_tunnel_failure()
 
             # Add context-aware recommendations if no clear root cause found
             self.add_context_aware_recommendations()
